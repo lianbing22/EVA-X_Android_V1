@@ -14,6 +14,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.media.FaceDetector
+import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
@@ -33,17 +34,15 @@ data class FaceTrackingState(
     /** Normalized vertical face offset in [-1f, 1f]: -1 = top edge, +1 = bottom edge */
     val faceY: Float = 0f,
     /** Relative face size/proximity in [0f, 1f] */
-    val faceScale: Float = 0.3f,
+    val faceScale: Float = 0.35f,
     val trackingSource: String = "未开启",
 )
 
 /**
- * Real-time front-camera face tracker for EVA-X desk companion gaze following.
- *
- * Uses a dual-engine pipeline:
- * 1. Hardware ISP Face Detection ([CaptureResult.STATISTICS_FACES]) at full sensor frame rate.
- * 2. Software [android.media.FaceDetector] + luminance centroid fallback on rotated upright
- *    mirror frames from a low-res YUV [ImageReader], ensuring 100% compatibility across phones.
+ * Triple-Engine Real-Time Front-Camera Face Tracker for EVA-X:
+ * 1. Hardware ISP Face Detection ([CaptureResult.STATISTICS_FACES]) at 30fps.
+ * 2. YCbCr Skin-Tone Face Blob & Android [FaceDetector] upright analysis (~10fps).
+ * 3. Luma Motion Centroid fusion so even in dim light or side-profile, head movement is tracked continuously.
  */
 class CameraFaceTracker(
     private val context: Context,
@@ -233,7 +232,7 @@ class CameraFaceTracker(
                                             val rawU = ((primaryFace.bounds.exactCenterX() - activeArray.left) / activeArray.width()).coerceIn(0f, 1f)
                                             val rawV = ((primaryFace.bounds.exactCenterY() - activeArray.top) / activeArray.height()).coerceIn(0f, 1f)
                                             val mapped = mapSensorToScreen(rawU, rawV)
-                                            val scale = (primaryFace.bounds.width().toFloat() / activeArray.width().toFloat()).coerceIn(0.1f, 0.9f)
+                                            val scale = (primaryFace.bounds.width().toFloat() / activeArray.width().toFloat()).coerceIn(0.15f, 0.90f)
 
                                             lastHardwareFaceTimestampMs = System.currentTimeMillis()
                                             updateFaceTarget(
@@ -268,42 +267,54 @@ class CameraFaceTracker(
 
         try {
             val now = System.currentTimeMillis()
-            // Skip if hardware ISP face detection is actively reporting or throttle software pass to ~7 fps
-            if (now - lastHardwareFaceTimestampMs < 450L || now - lastSoftwareFrameTimestampMs < 140L) {
+            // Skip software pass if hardware ISP face detection just reported within 350ms, or throttle to ~10fps
+            if (now - lastHardwareFaceTimestampMs < 350L || now - lastSoftwareFrameTimestampMs < 95L) {
                 return
             }
             lastSoftwareFrameTimestampMs = now
 
-            val plane = image.planes.firstOrNull() ?: return
-            val buffer = plane.buffer
-            val rowStride = plane.rowStride
-            val pixelStride = plane.pixelStride
-            val srcW = image.width
-            val srcH = image.height
+            val planes = image.planes
+            if (planes.isEmpty()) return
 
-            // Downsample to an upright 80x80 RGB_565 bitmap for Android FaceDetector & motion tracking
-            val targetSize = 80
-            val bitmap = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
+            val targetSize = 64
             val currentGrid = FloatArray(targetSize * targetSize)
+
+            // Track skin-tone centroid in YCbCr space + build grayscale bitmap for FaceDetector
+            val bitmap = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.RGB_565)
+            var skinWeightedX = 0f
+            var skinWeightedY = 0f
+            var skinTotalWeight = 0f
 
             for (ty in 0 until targetSize) {
                 val screenY = (ty + 0.5f) / targetSize
+                // Center bias weight so background walls at extreme edges have lower weight
+                val wy = 1f - 0.35f * abs(screenY - 0.5f)
                 for (tx in 0 until targetSize) {
                     val screenX = (tx + 0.5f) / targetSize
+                    val wx = 1f - 0.25f * abs(screenX - 0.5f)
                     val sensorPt = mapScreenToSensor(screenX, screenY)
-                    val sx = (sensorPt.x * (srcW - 1)).toInt().coerceIn(0, srcW - 1)
-                    val sy = (sensorPt.y * (srcH - 1)).toInt().coerceIn(0, srcH - 1)
-                    val index = sy * rowStride + sx * pixelStride
-                    val luma = if (index in 0 until buffer.limit()) {
-                        buffer.get(index).toInt() and 0xFF
-                    } else {
-                        128
+
+                    val yuv = sampleYuv(image, sensorPt.x, sensorPt.y)
+                    val yVal = yuv[0]
+                    val uVal = yuv[1] // Cb
+                    val vVal = yuv[2] // Cr
+
+                    currentGrid[ty * targetSize + tx] = yVal.toFloat()
+                    bitmap.setPixel(tx, ty, Color.rgb(yVal, yVal, yVal))
+
+                    // Standard human skin-tone cluster in YCbCr: Y in 45..235, Cb in 77..127, Cr in 133..178
+                    if (yVal in 45..235 && uVal in 77..127 && vVal in 133..178) {
+                        // Closeness to core skin chrominance (Cb=105, Cr=152)
+                        val chromaAffinity = (1f - (abs(uVal - 105) / 30f) - (abs(vVal - 152) / 30f)).coerceIn(0.2f, 1f)
+                        val w = chromaAffinity * wx * wy
+                        skinWeightedX += tx * w
+                        skinWeightedY += ty * w
+                        skinTotalWeight += w
                     }
-                    currentGrid[ty * targetSize + tx] = luma.toFloat()
-                    bitmap.setPixel(tx, ty, Color.rgb(luma, luma, luma))
                 }
             }
 
+            // 1. Try Android FaceDetector first for exact inter-eye midpoint
             val detector = FaceDetector(targetSize, targetSize, 1)
             val detected = arrayOfNulls<FaceDetector.Face>(1)
             val count = detector.findFaces(bitmap, detected)
@@ -315,58 +326,106 @@ class CameraFaceTracker(
                 face.getMidPoint(mid)
                 val normX = ((mid.x / targetSize) - 0.5f) * 2f
                 val normY = ((mid.y / targetSize) - 0.5f) * 2f
-                val scale = ((face.eyesDistance() * 2.4f) / targetSize).coerceIn(0.15f, 0.85f)
+                val scale = ((face.eyesDistance() * 2.4f) / targetSize).coerceIn(0.18f, 0.85f)
                 previousLumaGrid = currentGrid
                 updateFaceTarget(
                     normX = normX,
                     normY = normY,
                     scale = scale,
-                    source = "视觉人脸锁定",
+                    source = "五官精准锁定",
                 )
                 return
             }
 
-            // Motion centroid fallback when user moves head in front of camera
+            // 2. Compute motion centroid from frame difference
             val prev = previousLumaGrid
             previousLumaGrid = currentGrid
+            var motionX = 0f
+            var motionY = 0f
+            var motionWeight = 0f
             if (prev != null) {
-                var weightedX = 0f
-                var weightedY = 0f
-                var totalWeight = 0f
-                for (ty in 8 until (targetSize - 8)) {
-                    for (tx in 8 until (targetSize - 8)) {
+                for (ty in 4 until (targetSize - 4)) {
+                    for (tx in 4 until (targetSize - 4)) {
                         val idx = ty * targetSize + tx
                         val diff = abs(currentGrid[idx] - prev[idx])
-                        if (diff > 14f) {
-                            weightedX += tx * diff
-                            weightedY += ty * diff
-                            totalWeight += diff
+                        if (diff > 10f) {
+                            motionX += tx * diff
+                            motionY += ty * diff
+                            motionWeight += diff
                         }
                     }
                 }
-                if (totalWeight > 950f) {
-                    val cx = weightedX / totalWeight
-                    val cy = weightedY / totalWeight
-                    val normX = ((cx / targetSize) - 0.5f) * 2f
-                    val normY = ((cy / targetSize) - 0.5f) * 2f
-                    updateFaceTarget(
-                        normX = normX,
-                        normY = normY,
-                        scale = 0.35f,
-                        source = "动态视觉跟随",
-                    )
-                } else if (now - lastHardwareFaceTimestampMs > 2_800L) {
-                    // Decay face lock gently if no face or motion for a while
-                    _state.value = _state.value.copy(
-                        faceDetected = false,
-                        trackingSource = "视觉感知中",
-                    )
-                }
+            }
+
+            // 3. Fuse YCbCr skin-tone face blob with motion centroid
+            val hasSkinFaceBlob = skinTotalWeight > 18f
+            val hasMotion = motionWeight > 360f
+
+            if (hasSkinFaceBlob && hasMotion) {
+                val sx = (skinWeightedX / skinTotalWeight) / targetSize
+                val sy = (skinWeightedY / skinTotalWeight) / targetSize
+                val mx = (motionX / motionWeight) / targetSize
+                val my = (motionY / motionWeight) / targetSize
+                val fusedX = (sx * 0.65f + mx * 0.35f - 0.5f) * 2f
+                val fusedY = (sy * 0.65f + my * 0.35f - 0.5f) * 2f
+                updateFaceTarget(
+                    normX = fusedX,
+                    normY = fusedY,
+                    scale = (skinTotalWeight / (targetSize * targetSize * 0.35f)).coerceIn(0.2f, 0.8f),
+                    source = "人脸实时跟随",
+                )
+            } else if (hasSkinFaceBlob) {
+                val sx = (skinWeightedX / skinTotalWeight) / targetSize
+                val sy = (skinWeightedY / skinTotalWeight) / targetSize
+                updateFaceTarget(
+                    normX = (sx - 0.5f) * 2f,
+                    normY = (sy - 0.5f) * 2f,
+                    scale = (skinTotalWeight / (targetSize * targetSize * 0.35f)).coerceIn(0.2f, 0.8f),
+                    source = "人脸实时跟随",
+                )
+            } else if (hasMotion) {
+                val mx = (motionX / motionWeight) / targetSize
+                val my = (motionY / motionWeight) / targetSize
+                updateFaceTarget(
+                    normX = (mx - 0.5f) * 2f,
+                    normY = (my - 0.5f) * 2f,
+                    scale = 0.35f,
+                    source = "动态视觉跟随",
+                )
             }
         } catch (_: Throwable) {
         } finally {
             image.close()
         }
+    }
+
+    private fun sampleYuv(image: Image, normU: Float, normV: Float): IntArray {
+        val w = image.width
+        val h = image.height
+        val x = (normU * (w - 1)).toInt().coerceIn(0, w - 1)
+        val y = (normV * (h - 1)).toInt().coerceIn(0, h - 1)
+
+        val yPlane = image.planes[0]
+        val yIdx = y * yPlane.rowStride + x * yPlane.pixelStride
+        val yBuf = yPlane.buffer
+        val yVal = if (yIdx in 0 until yBuf.limit()) (yBuf.get(yIdx).toInt() and 0xFF) else 128
+
+        if (image.planes.size < 3) {
+            return intArrayOf(yVal, 105, 152)
+        }
+
+        val uvX = x / 2
+        val uvY = y / 2
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val uIdx = uvY * uPlane.rowStride + uvX * uPlane.pixelStride
+        val vIdx = uvY * vPlane.rowStride + uvX * vPlane.pixelStride
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+        val uVal = if (uIdx in 0 until uBuf.limit()) (uBuf.get(uIdx).toInt() and 0xFF) else 128
+        val vVal = if (vIdx in 0 until vBuf.limit()) (vBuf.get(vIdx).toInt() and 0xFF) else 128
+
+        return intArrayOf(yVal, uVal, vVal)
     }
 
     private fun updateFaceTarget(
@@ -375,11 +434,11 @@ class CameraFaceTracker(
         scale: Float,
         source: String,
     ) {
-        // Exponential smoothing for lifelike gimbal-like eye gaze
-        val clampedX = (normX * 1.25f).coerceIn(-0.85f, 0.85f)
-        val clampedY = (normY * 1.15f).coerceIn(-0.65f, 0.65f)
-        smoothedX = smoothedX * 0.45f + clampedX * 0.55f
-        smoothedY = smoothedY * 0.45f + clampedY * 0.55f
+        // Amplify sensitivity slightly so even subtle head movements on a desk stand produce expressive eye motion
+        val clampedX = (normX * 1.45f).coerceIn(-0.90f, 0.90f)
+        val clampedY = (normY * 1.35f).coerceIn(-0.75f, 0.75f)
+        smoothedX = smoothedX * 0.38f + clampedX * 0.62f
+        smoothedY = smoothedY * 0.38f + clampedY * 0.62f
 
         _state.value = _state.value.copy(
             isCameraActive = true,
@@ -392,11 +451,7 @@ class CameraFaceTracker(
         )
     }
 
-    /**
-     * Maps normalized sensor coordinates (u, v) in [0, 1] to upright, mirrored screen coordinates (x, y) in [0, 1].
-     */
     private fun mapSensorToScreen(u: Float, v: Float): PointF {
-        // Step 1: Rotate clockwise by sensorOrientation to natural portrait upright
         var xp: Float
         var yp: Float
         when ((sensorOrientation % 360 + 360) % 360) {
@@ -417,12 +472,10 @@ class CameraFaceTracker(
                 yp = v
             }
         }
-        // Mirror horizontally for front-facing camera
         if (isFrontFacing) {
             xp = 1f - xp
         }
 
-        // Step 2: Adjust for current device display rotation (Portrait vs Landscape)
         return when (currentDisplayRotation()) {
             Surface.ROTATION_90 -> PointF(yp, 1f - xp)
             Surface.ROTATION_270 -> PointF(1f - yp, xp)
@@ -431,9 +484,6 @@ class CameraFaceTracker(
         }
     }
 
-    /**
-     * Inverse mapping from upright screen coordinates (x, y) in [0, 1] back to sensor coordinates (u, v) in [0, 1].
-     */
     private fun mapScreenToSensor(x: Float, y: Float): PointF {
         var xp: Float
         var yp: Float

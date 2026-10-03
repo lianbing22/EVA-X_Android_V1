@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +49,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.evax.mobile.presentation.AssistantPhase
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -126,14 +128,33 @@ fun AssistantAvatar(
 
     var touchGaze by remember { mutableStateOf<Offset?>(null) }
     var winkTriggered by remember { mutableStateOf(false) }
+    var showCompletionSmile by remember { mutableStateOf(false) }
+
+    // Automatically clear touchGaze after 2.2s so camera face tracking is never permanently blocked
+    LaunchedEffect(touchGaze) {
+        if (touchGaze != null) {
+            delay(2_200L)
+            touchGaze = null
+        }
+    }
+
+    // Show happy completion smile (^ ^) for 2.4s when task finishes, then return to expressive tracking eyes
+    LaunchedEffect(phase) {
+        if (phase == AssistantPhase.COMPLETED) {
+            showCompletionSmile = true
+            delay(2_400L)
+            showCompletionSmile = false
+        } else {
+            showCompletionSmile = false
+        }
+    }
 
     val primaryAccent by animateColorAsState(
         targetValue = when {
             companionMode == EvaCompanionMode.DND -> Color(0xFF4AD8FF)
-            eyeStyle == EvaEyeStyle.EVA_MINT && phase == AssistantPhase.IDLE -> Color(0xFF4AF5A8)
+            eyeStyle == EvaEyeStyle.EVA_MINT && (phase == AssistantPhase.IDLE || phase == AssistantPhase.COMPLETED) -> Color(0xFF4AF5A8)
             eyeStyle == EvaEyeStyle.EVA_MINT && phase == AssistantPhase.LISTENING -> Color(0xFF3BF8B5)
-            eyeStyle == EvaEyeStyle.EVA_MINT && phase == AssistantPhase.COMPLETED -> Color(0xFF56FFB8)
-            eyeStyle == EvaEyeStyle.GOLDEN_MECHA && phase == AssistantPhase.IDLE -> Color(0xFFFFC847)
+            eyeStyle == EvaEyeStyle.GOLDEN_MECHA && (phase == AssistantPhase.IDLE || phase == AssistantPhase.COMPLETED) -> Color(0xFFFFC847)
             else -> phaseAccentColor(phase)
         },
         animationSpec = tween(durationMillis = 360),
@@ -153,31 +174,25 @@ fun AssistantAvatar(
         label = "secondaryAccent",
     )
 
-    // Priority: 1. User tap gaze -> 2. Camera real-time face tracking -> 3. Autonomous idle animation
+    // Always follow face in ALL modes and ALL phases!
     val activeFaceGaze = touchGaze ?: faceOffset
 
     val targetGazeX = when {
-        companionMode != EvaCompanionMode.COMPANION -> 0f
-        activeFaceGaze != null -> activeFaceGaze.x.coerceIn(-0.78f, 0.78f)
-        phase == AssistantPhase.IDLE -> -0.20f + 0.34f * sin(cycle)
+        activeFaceGaze != null -> activeFaceGaze.x.coerceIn(-0.85f, 0.85f)
         phase == AssistantPhase.THINKING || phase == AssistantPhase.EXECUTING -> 0.30f * sin(cycle * 2f)
-        phase == AssistantPhase.LISTENING -> 0.08f * sin(cycle * 2f)
-        else -> 0f
+        phase == AssistantPhase.LISTENING -> 0.12f * sin(cycle * 2f)
+        else -> -0.18f + 0.34f * sin(cycle)
     }
     val targetGazeY = when {
-        companionMode != EvaCompanionMode.COMPANION -> 0f
-        activeFaceGaze != null -> activeFaceGaze.y.coerceIn(-0.58f, 0.58f)
-        phase == AssistantPhase.IDLE -> -0.05f + 0.12f * cos(cycle)
+        activeFaceGaze != null -> activeFaceGaze.y.coerceIn(-0.68f, 0.68f)
         phase == AssistantPhase.THINKING || phase == AssistantPhase.EXECUTING -> -0.22f
-        else -> 0f
+        else -> -0.04f + 0.12f * cos(cycle)
     }
     val targetTiltDeg = when {
-        companionMode != EvaCompanionMode.COMPANION -> 0f
-        activeFaceGaze != null -> activeFaceGaze.x * -7.5f
-        phase == AssistantPhase.IDLE -> -3.5f + 2.5f * sin(cycle)
-        phase == AssistantPhase.LISTENING -> 1.5f * sin(cycle * 2f)
+        activeFaceGaze != null -> activeFaceGaze.x * -8.5f
+        phase == AssistantPhase.IDLE || phase == AssistantPhase.COMPLETED -> -3.2f + 2.5f * sin(cycle)
+        phase == AssistantPhase.LISTENING -> 1.8f * sin(cycle * 2f)
         phase == AssistantPhase.THINKING || phase == AssistantPhase.EXECUTING -> -2.8f
-        phase == AssistantPhase.COMPLETED -> 2.2f * sin(cycle * 2f)
         phase == AssistantPhase.ERROR -> 3.5f * sin(cycle * 6f)
         else -> 0f
     }
@@ -205,8 +220,8 @@ fun AssistantAvatar(
         1f
     }
 
-    // Periodic or tap-triggered playful wink (like QwenNote Eva poster 1 & 3)
-    val isPlayfulWink = winkTriggered || (phase == AssistantPhase.IDLE && blinkTicker in 42f..55f && activeFaceGaze == null)
+    val isPlayfulWink = winkTriggered ||
+        ((phase == AssistantPhase.IDLE || phase == AssistantPhase.COMPLETED) && blinkTicker in 44f..54f && activeFaceGaze == null)
 
     val timeText = remember(blinkTicker.toInt() / 20) {
         SimpleDateFormat("HH : mm", Locale.getDefault()).format(Date())
@@ -226,8 +241,8 @@ fun AssistantAvatar(
                         val normX = ((tapOffset.x / size.width) - 0.5f) * 1.5f
                         val normY = ((tapOffset.y / size.height) - 0.5f) * 1.3f
                         touchGaze = Offset(
-                            normX.coerceIn(-0.75f, 0.75f),
-                            normY.coerceIn(-0.55f, 0.55f),
+                            normX.coerceIn(-0.78f, 0.78f),
+                            normY.coerceIn(-0.58f, 0.58f),
                         )
                     },
                 )
@@ -239,7 +254,18 @@ fun AssistantAvatar(
             .coerceAtMost(size.height * if (isLandscape) 2.25f else 1.85f)
         val visorHeight = size.height * 0.90f
 
-        // 1. Ambient outer glow
+        val baseEyeW = visorWidth * if (isLandscape) 0.31f else 0.34f
+        val baseEyeH = visorHeight * if (isLandscape) 0.68f else 0.64f
+        val eyeSpacing = visorWidth * 0.22f
+
+        // 3D perspective scaling when looking left/right toward user's face
+        val leftPerspective = (1f - gazeX * 0.22f).coerceIn(0.78f, 1.22f)
+        val rightPerspective = (1f + gazeX * 0.22f).coerceIn(0.78f, 1.22f)
+
+        val gazeShiftX = gazeX * baseEyeW * 0.46f
+        val gazeShiftY = gazeY * baseEyeH * 0.38f
+
+        // 1. Ambient outer glow (shifts slightly with gaze)
         drawCircle(
             brush = Brush.radialGradient(
                 colors = listOf(
@@ -247,14 +273,14 @@ fun AssistantAvatar(
                     secondaryAccent.copy(alpha = 0.05f),
                     Color.Transparent,
                 ),
-                center = center,
+                center = center + Offset(gazeShiftX * 0.5f, gazeShiftY * 0.5f),
                 radius = visorWidth * 0.62f,
             ),
             radius = visorWidth * 0.62f,
-            center = center,
+            center = center + Offset(gazeShiftX * 0.5f, gazeShiftY * 0.5f),
         )
 
-        // 2. Optional visor shell in Cyber Cozmo portrait mode; pure black seamless in Eva Mint / Landscape
+        // 2. Optional visor shell in Cyber Cozmo portrait mode
         if (!isLandscape && eyeStyle == EvaEyeStyle.CYBER_COZMO) {
             val visorRect = Rect(
                 left = center.x - visorWidth / 2f,
@@ -290,51 +316,9 @@ fun AssistantAvatar(
             )
         }
 
-        // Handle 3 Companion Modes (01 DND Diving Clock, 02 Companion, 03 Rest Sleeping Notes)
-        when (companionMode) {
-            EvaCompanionMode.DND -> {
-                drawDndDivingGogglesClock(
-                    center = center,
-                    visorWidth = visorWidth,
-                    visorHeight = visorHeight,
-                    timeText = timeText,
-                    textMeasurer = textMeasurer,
-                    pulse = fastPulse,
-                    cycle = cycle,
-                )
-                return@Canvas
-            }
-
-            EvaCompanionMode.REST -> {
-                drawRestSleepingFace(
-                    center = center,
-                    visorWidth = visorWidth,
-                    visorHeight = visorHeight,
-                    accent = Color(0xFF4AF5A8),
-                    cycle = cycle,
-                    textMeasurer = textMeasurer,
-                )
-                return@Canvas
-            }
-
-            EvaCompanionMode.COMPANION -> Unit
-        }
-
-        val baseEyeW = visorWidth * if (isLandscape) 0.31f else 0.34f
-        val baseEyeH = visorHeight * if (isLandscape) 0.68f else 0.64f
-        val eyeSpacing = visorWidth * 0.22f
-
-        // 3D perspective scaling when looking left/right toward user's face
-        val leftPerspective = (1f - gazeX * 0.18f).coerceIn(0.82f, 1.18f)
-        val rightPerspective = (1f + gazeX * 0.18f).coerceIn(0.82f, 1.18f)
-
-        val gazeShiftX = gazeX * baseEyeW * 0.36f
-        val gazeShiftY = gazeY * baseEyeH * 0.30f
-
-        // Side mecha HUD brackets for GOLDEN_MECHA style (matches eva7.jpg top-left style 3)
         if (eyeStyle == EvaEyeStyle.GOLDEN_MECHA) {
             drawMechaSideBrackets(
-                center = center,
+                center = center + Offset(gazeShiftX * 0.3f, gazeShiftY * 0.3f),
                 visorWidth = visorWidth,
                 visorHeight = visorHeight,
                 accent = Color(0xFF7FA6C9),
@@ -344,6 +328,7 @@ fun AssistantAvatar(
         withTransform({
             rotate(degrees = headTilt, pivot = center)
         }) {
+            val shiftedCenter = Offset(center.x + gazeShiftX, center.y + gazeShiftY)
             val leftCenter = Offset(
                 x = center.x - eyeSpacing + gazeShiftX,
                 y = center.y + gazeShiftY,
@@ -353,143 +338,177 @@ fun AssistantAvatar(
                 y = center.y + gazeShiftY,
             )
 
-            when (phase) {
-                AssistantPhase.COMPLETED -> {
-                    drawHappyCompletedFace(
-                        leftCenter = leftCenter,
-                        rightCenter = rightCenter,
-                        faceCenter = Offset(center.x + gazeShiftX * 0.6f, center.y + gazeShiftY * 0.6f),
-                        eyeWidth = baseEyeW * 0.80f,
-                        eyeHeight = baseEyeH * 0.48f,
-                        accent = primaryAccent,
+            // Handle 3 Companion Modes inside the gaze-tracking transform so ALL modes follow user's face!
+            when (companionMode) {
+                EvaCompanionMode.DND -> {
+                    drawDndDivingGogglesClock(
+                        center = shiftedCenter,
+                        visorWidth = visorWidth,
+                        visorHeight = visorHeight,
+                        timeText = timeText,
+                        textMeasurer = textMeasurer,
                         pulse = fastPulse,
-                        isSpeaking = isSpeaking,
+                        cycle = cycle,
                     )
+                    return@withTransform
                 }
 
-                else -> {
-                    val leftHeightScale = when (phase) {
-                        AssistantPhase.THINKING, AssistantPhase.EXECUTING -> 0.68f
-                        AssistantPhase.LISTENING -> 1.06f
-                        AssistantPhase.ERROR -> 0.82f
-                        else -> 1.0f
-                    } * autoBlinkScale
+                EvaCompanionMode.REST -> {
+                    drawRestSleepingFace(
+                        leftCenter = leftCenter,
+                        rightCenter = rightCenter,
+                        eyeWidth = baseEyeW * 0.82f,
+                        eyeHeight = baseEyeH * 0.38f,
+                        leftScale = leftPerspective,
+                        rightScale = rightPerspective,
+                        accent = Color(0xFF4AF5A8),
+                        cycle = cycle,
+                        textMeasurer = textMeasurer,
+                    )
+                    return@withTransform
+                }
 
-                    val rightHeightScale = when (phase) {
-                        AssistantPhase.THINKING, AssistantPhase.EXECUTING -> 0.96f
-                        AssistantPhase.LISTENING -> 1.06f
-                        AssistantPhase.ERROR -> 0.82f
-                        else -> 0.96f
-                    } * autoBlinkScale
+                EvaCompanionMode.COMPANION -> Unit
+            }
 
-                    when (eyeStyle) {
-                        EvaEyeStyle.EVA_MINT -> {
-                            drawEvaMintJellyEye(
-                                center = leftCenter,
-                                width = baseEyeW * leftPerspective,
-                                height = baseEyeH * leftPerspective * leftHeightScale,
-                                primary = primaryAccent,
-                                secondary = secondaryAccent,
-                                phase = phase,
-                                isLeft = true,
-                                isWinking = false,
-                                pulse = fastPulse,
-                            )
+            if ((phase == AssistantPhase.COMPLETED && showCompletionSmile) || isSpeaking) {
+                drawHappyCompletedFace(
+                    leftCenter = leftCenter,
+                    rightCenter = rightCenter,
+                    faceCenter = shiftedCenter,
+                    eyeWidth = baseEyeW * 0.80f,
+                    eyeHeight = baseEyeH * 0.48f,
+                    leftScale = leftPerspective,
+                    rightScale = rightPerspective,
+                    accent = primaryAccent,
+                    pulse = fastPulse,
+                    isSpeaking = isSpeaking,
+                )
+            } else {
+                val leftHeightScale = when (phase) {
+                    AssistantPhase.THINKING, AssistantPhase.EXECUTING -> 0.68f
+                    AssistantPhase.LISTENING -> 1.06f
+                    AssistantPhase.ERROR -> 0.82f
+                    else -> 1.0f
+                } * autoBlinkScale
 
-                            drawEvaMintJellyEye(
-                                center = rightCenter,
-                                width = baseEyeW * rightPerspective,
-                                height = baseEyeH * rightPerspective * rightHeightScale,
-                                primary = primaryAccent,
-                                secondary = secondaryAccent,
-                                phase = phase,
-                                isLeft = false,
-                                isWinking = isPlayfulWink && phase == AssistantPhase.IDLE,
-                                pulse = fastPulse,
-                            )
-                        }
+                val rightHeightScale = when (phase) {
+                    AssistantPhase.THINKING, AssistantPhase.EXECUTING -> 0.96f
+                    AssistantPhase.LISTENING -> 1.06f
+                    AssistantPhase.ERROR -> 0.82f
+                    else -> 0.96f
+                } * autoBlinkScale
 
-                        EvaEyeStyle.CYBER_COZMO -> {
-                            drawCyberSquircleEye(
-                                center = leftCenter,
-                                width = baseEyeW * leftPerspective,
-                                height = baseEyeH * leftPerspective * leftHeightScale,
-                                gazeX = gazeX,
-                                gazeY = gazeY,
-                                primary = primaryAccent,
-                                secondary = secondaryAccent,
-                                phase = phase,
-                                isLeft = true,
-                                scanProgress = fastPulse,
-                            )
-
-                            drawCyberSquircleEye(
-                                center = rightCenter,
-                                width = baseEyeW * rightPerspective,
-                                height = baseEyeH * rightPerspective * rightHeightScale,
-                                gazeX = gazeX,
-                                gazeY = gazeY,
-                                primary = primaryAccent,
-                                secondary = secondaryAccent,
-                                phase = phase,
-                                isLeft = false,
-                                scanProgress = fastPulse,
-                            )
-                        }
-
-                        EvaEyeStyle.GOLDEN_MECHA -> {
-                            drawGoldenMechaEye(
-                                center = leftCenter,
-                                radius = (baseEyeW.coerceAtMost(baseEyeH) * 0.48f) * leftPerspective,
-                                heightScale = leftHeightScale,
-                                gazeX = gazeX,
-                                gazeY = gazeY,
-                                primary = primaryAccent,
-                                secondary = secondaryAccent,
-                            )
-                            drawGoldenMechaEye(
-                                center = rightCenter,
-                                radius = (baseEyeW.coerceAtMost(baseEyeH) * 0.48f) * rightPerspective,
-                                heightScale = rightHeightScale,
-                                gazeX = gazeX,
-                                gazeY = gazeY,
-                                primary = primaryAccent,
-                                secondary = secondaryAccent,
-                            )
-                        }
-                    }
-
-                    if (phase == AssistantPhase.THINKING || phase == AssistantPhase.EXECUTING) {
-                        drawThinkingEyebrows(
-                            leftCenter = leftCenter,
-                            rightCenter = rightCenter,
-                            eyeWidth = baseEyeW,
-                            eyeHeight = baseEyeH,
-                            accent = primaryAccent,
+                when (eyeStyle) {
+                    EvaEyeStyle.EVA_MINT -> {
+                        drawEvaMintJellyEye(
+                            center = leftCenter,
+                            width = baseEyeW * leftPerspective,
+                            height = baseEyeH * leftPerspective * leftHeightScale,
+                            gazeX = gazeX,
+                            gazeY = gazeY,
+                            primary = primaryAccent,
+                            secondary = secondaryAccent,
+                            phase = phase,
+                            isLeft = true,
+                            isWinking = false,
+                            pulse = fastPulse,
                         )
-                    } else if (phase == AssistantPhase.ERROR) {
-                        drawErrorEyebrowsAndSweatDrops(
-                            leftCenter = leftCenter,
-                            rightCenter = rightCenter,
-                            eyeWidth = baseEyeW,
-                            eyeHeight = baseEyeH,
-                            accent = primaryAccent,
+
+                        drawEvaMintJellyEye(
+                            center = rightCenter,
+                            width = baseEyeW * rightPerspective,
+                            height = baseEyeH * rightPerspective * rightHeightScale,
+                            gazeX = gazeX,
+                            gazeY = gazeY,
+                            primary = primaryAccent,
+                            secondary = secondaryAccent,
+                            phase = phase,
+                            isLeft = false,
+                            isWinking = isPlayfulWink && (phase == AssistantPhase.IDLE || phase == AssistantPhase.COMPLETED),
                             pulse = fastPulse,
                         )
                     }
+
+                    EvaEyeStyle.CYBER_COZMO -> {
+                        drawCyberSquircleEye(
+                            center = leftCenter,
+                            width = baseEyeW * leftPerspective,
+                            height = baseEyeH * leftPerspective * leftHeightScale,
+                            gazeX = gazeX,
+                            gazeY = gazeY,
+                            primary = primaryAccent,
+                            secondary = secondaryAccent,
+                            phase = phase,
+                            isLeft = true,
+                            scanProgress = fastPulse,
+                        )
+
+                        drawCyberSquircleEye(
+                            center = rightCenter,
+                            width = baseEyeW * rightPerspective,
+                            height = baseEyeH * rightPerspective * rightHeightScale,
+                            gazeX = gazeX,
+                            gazeY = gazeY,
+                            primary = primaryAccent,
+                            secondary = secondaryAccent,
+                            phase = phase,
+                            isLeft = false,
+                            scanProgress = fastPulse,
+                        )
+                    }
+
+                    EvaEyeStyle.GOLDEN_MECHA -> {
+                        drawGoldenMechaEye(
+                            center = leftCenter,
+                            radius = (baseEyeW.coerceAtMost(baseEyeH) * 0.48f) * leftPerspective,
+                            heightScale = leftHeightScale,
+                            gazeX = gazeX,
+                            gazeY = gazeY,
+                            primary = primaryAccent,
+                            secondary = secondaryAccent,
+                        )
+                        drawGoldenMechaEye(
+                            center = rightCenter,
+                            radius = (baseEyeW.coerceAtMost(baseEyeH) * 0.48f) * rightPerspective,
+                            heightScale = rightHeightScale,
+                            gazeX = gazeX,
+                            gazeY = gazeY,
+                            primary = primaryAccent,
+                            secondary = secondaryAccent,
+                        )
+                    }
+                }
+
+                if (phase == AssistantPhase.THINKING || phase == AssistantPhase.EXECUTING) {
+                    drawThinkingEyebrows(
+                        leftCenter = leftCenter,
+                        rightCenter = rightCenter,
+                        eyeWidth = baseEyeW,
+                        eyeHeight = baseEyeH,
+                        accent = primaryAccent,
+                    )
+                } else if (phase == AssistantPhase.ERROR) {
+                    drawErrorEyebrowsAndSweatDrops(
+                        leftCenter = leftCenter,
+                        rightCenter = rightCenter,
+                        eyeWidth = baseEyeW,
+                        eyeHeight = baseEyeH,
+                        accent = primaryAccent,
+                        pulse = fastPulse,
+                    )
                 }
             }
         }
     }
 }
 
-/**
- * Iconic DingTalk / QwenNote Eva Mint-Emerald Jelly Eye (replicates eva1.jpg, eva3.jpg, eva7.jpg).
- */
 private fun DrawScope.drawEvaMintJellyEye(
     center: Offset,
     width: Float,
     height: Float,
+    gazeX: Float,
+    gazeY: Float,
     primary: Color,
     secondary: Color,
     phase: AssistantPhase,
@@ -498,7 +517,6 @@ private fun DrawScope.drawEvaMintJellyEye(
     pulse: Float,
 ) {
     if (isWinking) {
-        // Playful curved crescent wink eye + golden 4-point star sparkle (exact match to eva1.jpg & eva3.jpg)
         val winkPath = Path().apply {
             moveTo(center.x - width * 0.48f, center.y + height * 0.14f)
             quadraticTo(
@@ -534,7 +552,6 @@ private fun DrawScope.drawEvaMintJellyEye(
             style = Stroke(width = 8.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
         )
 
-        // Golden 4-point sparkle star at top-right of the winking eye (from eva1.jpg)
         val starCenter = Offset(
             x = center.x + width * 0.62f,
             y = center.y - height * 0.24f,
@@ -557,7 +574,6 @@ private fun DrawScope.drawEvaMintJellyEye(
     )
     val corner = CornerRadius(width * 0.38f, width * 0.38f)
 
-    // Soft multi-layer emerald outer bloom
     drawRoundRect(
         color = primary.copy(alpha = 0.15f + 0.05f * pulse),
         topLeft = rect.topLeft - Offset(10.dp.toPx(), 10.dp.toPx()),
@@ -571,7 +587,6 @@ private fun DrawScope.drawEvaMintJellyEye(
         cornerRadius = CornerRadius(width * 0.40f, width * 0.40f),
     )
 
-    // Main jelly squircle body
     val eyePath = Path().apply {
         addRoundRect(RoundRect(rect, corner))
     }
@@ -588,22 +603,25 @@ private fun DrawScope.drawEvaMintJellyEye(
         ),
     )
 
-    // Subtle inner top jelly highlight
     clipPath(eyePath) {
+        // Parallax inner jelly core highlight that shifts with gazeX / gazeY
+        val highlightCenter = Offset(
+            x = rect.center.x + (gazeX * width * 0.22f) - width * 0.08f,
+            y = rect.top + safeHeight * 0.28f + (gazeY * safeHeight * 0.18f),
+        )
         drawCircle(
             brush = Brush.radialGradient(
                 colors = listOf(
-                    Color.White.copy(alpha = 0.42f),
+                    Color.White.copy(alpha = 0.50f),
                     Color.Transparent,
                 ),
-                center = Offset(rect.center.x - width * 0.12f, rect.top + safeHeight * 0.22f),
-                radius = width * 0.48f,
+                center = highlightCenter,
+                radius = width * 0.46f,
             ),
-            radius = width * 0.48f,
-            center = Offset(rect.center.x - width * 0.12f, rect.top + safeHeight * 0.22f),
+            radius = width * 0.46f,
+            center = highlightCenter,
         )
 
-        // Slanted upper eyelid for ERROR (sad slanted eyes like eva7.jpg) or THINKING
         if (phase == AssistantPhase.ERROR) {
             val sadMask = Path().apply {
                 moveTo(rect.left - 10f, rect.top - 10f)
@@ -655,9 +673,6 @@ private fun DrawScope.drawFourPointStar(
     drawPath(path = path, color = color)
 }
 
-/**
- * Mode 01: DND Diving Goggles with live digital clock & floating bubbles (replicates eva6.jpg 01 勿扰).
- */
 private fun DrawScope.drawDndDivingGogglesClock(
     center: Offset,
     visorWidth: Float,
@@ -677,7 +692,6 @@ private fun DrawScope.drawDndDivingGogglesClock(
     )
     val cyanFrame = Color(0xFF5CE1FF)
 
-    // Strap ears on left and right
     drawRoundRect(
         color = Color(0xFF287C9E),
         topLeft = Offset(goggleRect.left - 16.dp.toPx(), center.y - goggleH * 0.22f),
@@ -685,7 +699,6 @@ private fun DrawScope.drawDndDivingGogglesClock(
         cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
     )
 
-    // Snorkel tube on the right side (like eva6.jpg)
     val snorkelX = goggleRect.right + 14.dp.toPx()
     val snorkelPath = Path().apply {
         moveTo(snorkelX, center.y - goggleH * 0.58f)
@@ -703,7 +716,6 @@ private fun DrawScope.drawDndDivingGogglesClock(
         style = Stroke(width = 10.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
     )
 
-    // Outer goggle frame
     val corner = CornerRadius(goggleH * 0.46f, goggleH * 0.46f)
     drawRoundRect(
         color = Color(0xFF071521),
@@ -713,7 +725,7 @@ private fun DrawScope.drawDndDivingGogglesClock(
     )
     drawRoundRect(
         brush = Brush.verticalGradient(
-            colors = listOf( Color(0xFF9BF0FF), cyanFrame, Color(0xFF2B99C2)),
+            colors = listOf(Color(0xFF9BF0FF), cyanFrame, Color(0xFF2B99C2)),
         ),
         topLeft = goggleRect.topLeft,
         size = goggleRect.size,
@@ -721,7 +733,6 @@ private fun DrawScope.drawDndDivingGogglesClock(
         style = Stroke(width = 7.dp.toPx()),
     )
 
-    // Digital Clock inside the diving goggles
     val style = TextStyle(
         color = Color.White,
         fontSize = (goggleH * 0.34f).toSp(),
@@ -737,7 +748,6 @@ private fun DrawScope.drawDndDivingGogglesClock(
         ),
     )
 
-    // Floating water bubbles above snorkel
     val bubbleOffsetY = (sin(cycle) * 8.dp.toPx())
     drawCircle(
         color = cyanFrame.copy(alpha = 0.65f),
@@ -751,29 +761,27 @@ private fun DrawScope.drawDndDivingGogglesClock(
     )
 }
 
-/**
- * Mode 03: Rest / Sleeping face with gentle curved closed eyes & musical notes (replicates eva6.jpg 03 静息).
- */
 private fun DrawScope.drawRestSleepingFace(
-    center: Offset,
-    visorWidth: Float,
-    visorHeight: Float,
+    leftCenter: Offset,
+    rightCenter: Offset,
+    eyeWidth: Float,
+    eyeHeight: Float,
+    leftScale: Float,
+    rightScale: Float,
     accent: Color,
     cycle: Float,
     textMeasurer: androidx.compose.ui.text.TextMeasurer,
 ) {
-    val eyeW = visorWidth * 0.26f
-    val eyeH = visorHeight * 0.24f
-    val spacing = visorWidth * 0.22f
-
-    fun drawSleepingArc(c: Offset) {
+    fun drawSleepingArc(c: Offset, scale: Float) {
+        val w = eyeWidth * scale
+        val h = eyeHeight * scale
         val path = Path().apply {
-            moveTo(c.x - eyeW * 0.5f, c.y - eyeH * 0.1f)
+            moveTo(c.x - w * 0.5f, c.y - h * 0.1f)
             quadraticTo(
                 c.x,
-                c.y + eyeH * 0.55f,
-                c.x + eyeW * 0.5f,
-                c.y - eyeH * 0.1f,
+                c.y + h * 0.65f,
+                c.x + w * 0.5f,
+                c.y - h * 0.1f,
             )
         }
         drawPath(
@@ -788,10 +796,9 @@ private fun DrawScope.drawRestSleepingFace(
         )
     }
 
-    drawSleepingArc(Offset(center.x - spacing, center.y + eyeH * 0.15f))
-    drawSleepingArc(Offset(center.x + spacing, center.y + eyeH * 0.15f))
+    drawSleepingArc(leftCenter, leftScale)
+    drawSleepingArc(rightCenter, rightScale)
 
-    // Floating musical notes & zZz (like eva6.jpg right card)
     val floatY = sin(cycle) * 7.dp.toPx()
     val noteStyle = TextStyle(
         color = Color(0xFF68B5FF),
@@ -802,11 +809,11 @@ private fun DrawScope.drawRestSleepingFace(
     val note2 = textMeasurer.measure("♫", noteStyle)
     drawText(
         textLayoutResult = note1,
-        topLeft = Offset(center.x - spacing * 1.35f, center.y - eyeH * 1.1f + floatY),
+        topLeft = Offset(leftCenter.x - eyeWidth * 0.6f, leftCenter.y - eyeHeight * 1.3f + floatY),
     )
     drawText(
         textLayoutResult = note2,
-        topLeft = Offset(center.x - spacing * 0.65f, center.y - eyeH * 1.65f - floatY),
+        topLeft = Offset(rightCenter.x + eyeWidth * 0.35f, rightCenter.y - eyeHeight * 1.5f - floatY),
     )
 }
 
@@ -837,7 +844,7 @@ private fun DrawScope.drawGoldenMechaEye(
             radius = radius,
             center = center,
         )
-        val pupilCenter = center + Offset(gazeX * radius * 0.22f, gazeY * radius * 0.22f)
+        val pupilCenter = center + Offset(gazeX * radius * 0.26f, gazeY * radius * 0.26f)
         drawCircle(
             color = Color(0xFF0A0D12),
             radius = radius * 0.56f,
@@ -933,7 +940,7 @@ private fun DrawScope.drawCyberSquircleEye(
 
     val irisW = width * 0.74f
     val irisH = (safeHeight * 0.74f).coerceAtLeast(width * 0.08f)
-    val irisOffset = Offset(gazeX * width * 0.08f, gazeY * safeHeight * 0.08f)
+    val irisOffset = Offset(gazeX * width * 0.10f, gazeY * safeHeight * 0.10f)
     val irisCenter = center + irisOffset
     val irisRect = Rect(
         left = irisCenter.x - irisW / 2f,
@@ -974,7 +981,7 @@ private fun DrawScope.drawCyberSquircleEye(
         if (safeHeight > width * 0.28f) {
             val pupilW = irisW * if (phase == AssistantPhase.LISTENING) 0.42f else 0.46f
             val pupilH = irisH * if (phase == AssistantPhase.LISTENING) 0.42f else 0.48f
-            val pupilCenter = irisCenter + Offset(gazeX * irisW * 0.12f, gazeY * irisH * 0.12f)
+            val pupilCenter = irisCenter + Offset(gazeX * irisW * 0.14f, gazeY * irisH * 0.14f)
             val pupilRect = Rect(
                 left = pupilCenter.x - pupilW / 2f,
                 top = pupilCenter.y - pupilH / 2f,
@@ -1058,9 +1065,6 @@ private fun DrawScope.drawThinkingEyebrows(
     )
 }
 
-/**
- * Sad / apologetic eyebrows + cute white sweat drops on the side (replicates eva7.jpg "主人别生气了，我错了！").
- */
 private fun DrawScope.drawErrorEyebrowsAndSweatDrops(
     leftCenter: Offset,
     rightCenter: Offset,
@@ -1080,7 +1084,6 @@ private fun DrawScope.drawErrorEyebrowsAndSweatDrops(
     drawPath(leftBrow, accent, style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round))
     drawPath(rightBrow, accent, style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round))
 
-    // Cute white sweat drops around the eyes (like eva7.jpg center phone)
     val dropShift = pulse * 4.dp.toPx()
     drawSweatDrop(
         top = Offset(leftCenter.x - eyeWidth * 0.62f, leftCenter.y - eyeHeight * 0.25f + dropShift),
@@ -1109,18 +1112,22 @@ private fun DrawScope.drawHappyCompletedFace(
     faceCenter: Offset,
     eyeWidth: Float,
     eyeHeight: Float,
+    leftScale: Float,
+    rightScale: Float,
     accent: Color,
     pulse: Float,
     isSpeaking: Boolean,
 ) {
-    fun drawHappyEye(c: Offset) {
+    fun drawHappyEye(c: Offset, scale: Float) {
+        val w = eyeWidth * scale
+        val h = eyeHeight * scale
         val path = Path().apply {
-            moveTo(c.x - eyeWidth * 0.46f, c.y + eyeHeight * 0.22f)
+            moveTo(c.x - w * 0.46f, c.y + h * 0.22f)
             quadraticTo(
                 c.x,
-                c.y - eyeHeight * 0.58f,
-                c.x + eyeWidth * 0.46f,
-                c.y + eyeHeight * 0.22f,
+                c.y - h * 0.58f,
+                c.x + w * 0.46f,
+                c.y + h * 0.22f,
             )
         }
         drawPath(
@@ -1135,8 +1142,8 @@ private fun DrawScope.drawHappyCompletedFace(
         )
     }
 
-    drawHappyEye(leftCenter.copy(y = faceCenter.y - eyeHeight * 0.12f))
-    drawHappyEye(rightCenter.copy(y = faceCenter.y - eyeHeight * 0.12f))
+    drawHappyEye(leftCenter.copy(y = faceCenter.y - eyeHeight * 0.12f), leftScale)
+    drawHappyEye(rightCenter.copy(y = faceCenter.y - eyeHeight * 0.12f), rightScale)
 
     val mouthOpen = if (isSpeaking) (0.35f + 0.45f * pulse) else 0.42f
     val mouthW = eyeWidth * 0.54f

@@ -1,18 +1,23 @@
 package com.evax.mobile
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Bundle
+import android.speech.RecognizerIntent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -26,10 +31,12 @@ import com.evax.mobile.domain.SpeechInputFailure
 import com.evax.mobile.platform.vision.CameraFaceTracker
 import com.evax.mobile.platform.voice.AndroidSpeechInputController
 import com.evax.mobile.platform.voice.AndroidTextToSpeechController
+import com.evax.mobile.platform.voice.RealAudioMicMonitor
 import com.evax.mobile.presentation.ConversationViewModel
 import com.evax.mobile.presentation.MessageRole
 import com.evax.mobile.ui.ConversationScreen
 import com.evax.mobile.ui.theme.EvaXTheme
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val conversationViewModel: ConversationViewModel by viewModels {
@@ -39,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var speechInputController: AndroidSpeechInputController
     private lateinit var speechOutputController: AndroidTextToSpeechController
     private lateinit var cameraFaceTracker: CameraFaceTracker
+    private val realAudioMicMonitor = RealAudioMicMonitor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,13 +61,40 @@ class MainActivity : ComponentActivity() {
                 val faceTrackingState by cameraFaceTracker.state.collectAsStateWithLifecycle()
                 var permissionWasDenied by rememberSaveable { mutableStateOf(false) }
                 var cameraPromptedOnLaunch by rememberSaveable { mutableStateOf(false) }
+                var showLiveVoiceSheet by rememberSaveable { mutableStateOf(false) }
+                var liveMicLevel by rememberSaveable { mutableFloatStateOf(0.15f) }
+
+                val systemSpeechLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartActivityForResult(),
+                ) { result ->
+                    if (result.resultCode == Activity.RESULT_OK) {
+                        val recognized = result.data
+                            ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                            ?.firstOrNull { it.isNotBlank() }
+                            .orEmpty()
+                        if (recognized.isNotBlank()) {
+                            conversationViewModel.onSpeechResult(recognized)
+                        } else {
+                            conversationViewModel.onSpeechFailure(SpeechInputFailure.NO_MATCH)
+                        }
+                    } else {
+                        conversationViewModel.onListeningCancelled()
+                    }
+                }
 
                 val micPermissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestPermission(),
                 ) { isGranted ->
                     if (isGranted) {
                         permissionWasDenied = false
-                        startSpeechRecognition()
+                        startSpeechRecognition(
+                            systemSpeechLauncher = systemSpeechLauncher,
+                            onUpdateMicLevel = { liveMicLevel = it },
+                            onOpenLiveSheetFallback = {
+                                showLiveVoiceSheet = true
+                                realAudioMicMonitor.start { level -> liveMicLevel = level }
+                            },
+                        )
                     } else {
                         permissionWasDenied = true
                         conversationViewModel.onSpeechFailure(SpeechInputFailure.PERMISSION_DENIED)
@@ -99,7 +134,14 @@ class MainActivity : ComponentActivity() {
                     onMicTap = {
                         when {
                             checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED ->
-                                startSpeechRecognition()
+                                startSpeechRecognition(
+                                    systemSpeechLauncher = systemSpeechLauncher,
+                                    onUpdateMicLevel = { liveMicLevel = it },
+                                    onOpenLiveSheetFallback = {
+                                        showLiveVoiceSheet = true
+                                        realAudioMicMonitor.start { level -> liveMicLevel = level }
+                                    },
+                                )
 
                             permissionWasDenied ->
                                 conversationViewModel.onSpeechFailure(SpeechInputFailure.PERMISSION_DENIED)
@@ -134,6 +176,13 @@ class MainActivity : ComponentActivity() {
                             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                         }
                     },
+                    showLiveVoiceSheet = showLiveVoiceSheet,
+                    liveMicLevel = liveMicLevel,
+                    onDismissLiveVoiceSheet = {
+                        showLiveVoiceSheet = false
+                        realAudioMicMonitor.stop()
+                        conversationViewModel.onListeningCancelled()
+                    },
                 )
             }
         }
@@ -149,6 +198,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        realAudioMicMonitor.stop()
         if (::speechInputController.isInitialized) {
             speechInputController.cancel()
             conversationViewModel.onListeningCancelled()
@@ -159,18 +209,64 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        realAudioMicMonitor.stop()
         if (::speechInputController.isInitialized) speechInputController.destroy()
         if (::speechOutputController.isInitialized) speechOutputController.shutdown()
         if (::cameraFaceTracker.isInitialized) cameraFaceTracker.stop()
         super.onDestroy()
     }
 
-    private fun startSpeechRecognition() {
+    private fun startSpeechRecognition(
+        systemSpeechLauncher: ActivityResultLauncher<Intent>,
+        onUpdateMicLevel: (Float) -> Unit,
+        onOpenLiveSheetFallback: () -> Unit,
+    ) {
         conversationViewModel.onListeningStarted()
         speechInputController.start(
             onResult = conversationViewModel::onSpeechResult,
-            onFailure = conversationViewModel::onSpeechFailure,
+            onPartialResult = { partial ->
+                if (partial.isNotBlank()) {
+                    conversationViewModel.onDraftChanged(partial)
+                }
+            },
+            onRmsChanged = { rmsdB ->
+                val normalized = ((rmsdB + 2f) / 12f).coerceIn(0.05f, 1.0f)
+                onUpdateMicLevel(normalized)
+            },
+            onFailure = { failure ->
+                if (failure == SpeechInputFailure.SERVICE_UNAVAILABLE || failure == SpeechInputFailure.UNKNOWN) {
+                    // Fallback 2: Launch system RecognizerIntent.ACTION_RECOGNIZE_SPEECH dialog if available
+                    if (!tryLaunchSystemSpeechDialog(systemSpeechLauncher)) {
+                        // Fallback 3: Open built-in Real Audio Mic Monitor + Live Voice Dictation Sheet
+                        onOpenLiveSheetFallback()
+                    }
+                } else {
+                    conversationViewModel.onSpeechFailure(failure)
+                }
+            },
         )
+    }
+
+    private fun tryLaunchSystemSpeechDialog(
+        launcher: ActivityResultLauncher<Intent>,
+    ): Boolean {
+        return try {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN")
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, Locale.getDefault().toLanguageTag().ifBlank { "zh-CN" })
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "请对 EVA-X 说出你的指令…")
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            }
+            if (intent.resolveActivity(packageManager) != null) {
+                launcher.launch(intent)
+                true
+            } else {
+                false
+            }
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun isRunningInstrumentationTest(): Boolean {

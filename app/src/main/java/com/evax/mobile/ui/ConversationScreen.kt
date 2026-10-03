@@ -60,6 +60,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -86,7 +88,6 @@ private val HudTileBg = Color(0xFF141926)
 private val EvaMint = Color(0xFF4AF5A8)
 private val HudCyan = Color(0xFF00F5D4)
 private val HudViolet = Color(0xFFB9A9FF)
-private val HudEmerald = Color(0xFF5CE6B0)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -100,6 +101,9 @@ fun ConversationScreen(
     faceTrackingState: FaceTrackingState = FaceTrackingState(),
     onToggleCameraTracking: () -> Unit = {},
     onToggleOrientation: () -> Unit = {},
+    showLiveVoiceSheet: Boolean = false,
+    liveMicLevel: Float = 0f,
+    onDismissLiveVoiceSheet: () -> Unit = {},
 ) {
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -110,7 +114,6 @@ fun ConversationScreen(
     var showVoiceDisclosure by rememberSaveable { mutableStateOf(false) }
     var voiceDisclosureAccepted by rememberSaveable { mutableStateOf(false) }
 
-    // Pure full-screen eyes mode vs HUD split/deck mode
     var pureEyesMode by rememberSaveable { mutableStateOf(false) }
     var eyeStyleOrdinal by rememberSaveable { mutableStateOf(EvaEyeStyle.EVA_MINT.ordinal) }
     var companionModeOrdinal by rememberSaveable { mutableStateOf(EvaCompanionMode.COMPANION.ordinal) }
@@ -134,7 +137,6 @@ fun ConversationScreen(
         )
     }
 
-    // Edge glow pulse (DingTalk QwenNote Eva: "屏幕四周亮起，代表Eva正在听你说话")
     val edgeTransition = rememberInfiniteTransition(label = "edge-aura")
     val edgePulse by edgeTransition.animateFloat(
         initialValue = 0.35f,
@@ -174,17 +176,18 @@ fun ConversationScreen(
                 .drawWithContent {
                     drawContent()
                     if (edgeGlowActive) {
+                        val boost = if (state.phase == AssistantPhase.LISTENING) (1f + liveMicLevel * 1.2f) else 1f
                         val strokeW = if (state.phase == AssistantPhase.LISTENING) {
-                            6.dp.toPx() * edgePulse
+                            (6.dp.toPx() * edgePulse * boost).coerceAtMost(14.dp.toPx())
                         } else {
                             3.dp.toPx() * (0.5f + 0.5f * edgePulse)
                         }
                         drawRoundRect(
                             brush = Brush.linearGradient(
                                 colors = listOf(
-                                    edgeColor.copy(alpha = 0.85f * edgePulse),
-                                    HudCyan.copy(alpha = 0.65f * edgePulse),
-                                    edgeColor.copy(alpha = 0.85f * edgePulse),
+                                    edgeColor.copy(alpha = (0.85f * edgePulse).coerceIn(0f, 1f)),
+                                    HudCyan.copy(alpha = (0.65f * edgePulse).coerceIn(0f, 1f)),
+                                    edgeColor.copy(alpha = (0.85f * edgePulse).coerceIn(0f, 1f)),
                                 ),
                             ),
                             topLeft = Offset(strokeW / 2f, strokeW / 2f),
@@ -289,13 +292,116 @@ fun ConversationScreen(
             },
         )
     }
+
+    // Fallback Live Microphone Voice Dictation Dialog when ROM blocks background SpeechRecognizer
+    if (showLiveVoiceSheet) {
+        val focusRequester = remember { FocusRequester() }
+        LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+        }
+        AlertDialog(
+            onDismissRequest = onDismissLiveVoiceSheet,
+            containerColor = Color(0xFF0B111C),
+            titleContentColor = EvaMint,
+            textContentColor = Color(0xFFE2EBF8),
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size((10 + liveMicLevel * 10).dp)
+                            .clip(CircleShape)
+                            .background(EvaMint),
+                    )
+                    Text("正在聆听你的声音…", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "麦克风已激活（声波灵敏度 ${(liveMicLevel * 100).toInt()}%）。由于当前手机系统未开放后台静默语音服务，已为你自动拉起输入法听写面板——请点击输入法键盘上的「🎤 麦克风」直接说话，或直接说出/输入任意指令：",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF9FB0C8),
+                    )
+                    OutlinedTextField(
+                        value = state.draft,
+                        onValueChange = onDraftChanged,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focusRequester),
+                        placeholder = {
+                            Text("点击键盘语音麦克风说话，或直接输入…", color = Color(0xFF6E7D94))
+                        },
+                        singleLine = false,
+                        maxLines = 3,
+                        shape = RoundedCornerShape(16.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = EvaMint,
+                            unfocusedBorderColor = Color(0xFF28374E),
+                            focusedContainerColor = Color(0xFF06090F),
+                            unfocusedContainerColor = Color(0xFF06090F),
+                        ),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(
+                            onSend = {
+                                if (state.draft.isNotBlank()) {
+                                    val text = state.draft
+                                    onDismissLiveVoiceSheet()
+                                    onSubmit(text)
+                                }
+                            },
+                        ),
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        LandscapeQuickChip("今天下午有什么安排", enabled = true) {
+                            onDismissLiveVoiceSheet()
+                            onSubmit("今天下午有什么安排")
+                        }
+                        LandscapeQuickChip("帮我整理刚才的会议纪要", enabled = true) {
+                            onDismissLiveVoiceSheet()
+                            onSubmit("帮我整理刚才的会议纪要")
+                        }
+                        LandscapeQuickChip("给王总发钉钉说方案写好了", enabled = true) {
+                            onDismissLiveVoiceSheet()
+                            onSubmit("给王总发钉钉说方案写好了")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val text = state.draft.trim()
+                        onDismissLiveVoiceSheet()
+                        if (text.isNotBlank()) {
+                            onSubmit(text)
+                        }
+                    },
+                    enabled = state.draft.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = EvaMint,
+                        contentColor = Color(0xFF04140C),
+                    ),
+                ) {
+                    Text("发送语音内容", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismissLiveVoiceSheet) {
+                    Text("取消", color = Color(0xFF9BA6BC))
+                }
+            },
+        )
+    }
 }
 
-/**
- * DingTalk / QwenNote Eva Horizontal (Landscape) Mode:
- * - Supports Full-Screen Giant Mint Eyes mode (replicates eva1.jpg / eva2.jpg / eva6.jpg / eva7.jpg)
- * - Supports Split-Screen Office Delivery HUD mode (replicates eva4.jpg bottom-left meeting/task split view)
- */
 @Composable
 private fun DingTalkEvaLandscapeLayout(
     state: ConversationUiState,
@@ -325,7 +431,6 @@ private fun DingTalkEvaLandscapeLayout(
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
-        // Top status & mode switch bar (DingTalk Eva style)
         EvaControlHeaderBar(
             phase = state.phase,
             pureEyesMode = pureEyesMode,
@@ -343,7 +448,6 @@ private fun DingTalkEvaLandscapeLayout(
         Spacer(Modifier.height(6.dp))
 
         if (pureEyesMode) {
-            // Full-Screen Giant Eyes Companion Mode (like eva1.jpg, eva2.jpg, eva6.jpg)
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -361,7 +465,6 @@ private fun DingTalkEvaLandscapeLayout(
                 )
             }
 
-            // Subtle floating subtitle pill at bottom center (exact match to eva2.jpg: "「主人，放心，一切包在我身上！」")
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -383,6 +486,8 @@ private fun DingTalkEvaLandscapeLayout(
                         .padding(horizontal = 12.dp),
                 ) {
                     val subtitleText = when {
+                        state.phase == AssistantPhase.LISTENING && state.draft.isNotBlank() ->
+                            "「正在听你说：${state.draft}…」"
                         companionMode != EvaCompanionMode.COMPANION ->
                             "「${companionMode.title}模式：${companionMode.subtitle}」"
                         latestAssistant != null -> "「${latestAssistant.text}」"
@@ -419,7 +524,6 @@ private fun DingTalkEvaLandscapeLayout(
                 }
             }
         } else {
-            // Split-Screen DingTalk Eva Mode: Left = Expressive Robot Face + Voice Action; Right = Office Delivery Card
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -427,7 +531,6 @@ private fun DingTalkEvaLandscapeLayout(
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // Left Pane (42%): Eva Giant Mint Eyes + Status Waveform + Quick Voice Controls (replicates eva4.jpg left side)
                 Column(
                     modifier = Modifier
                         .weight(0.44f)
@@ -461,10 +564,9 @@ private fun DingTalkEvaLandscapeLayout(
 
                     Spacer(Modifier.height(6.dp))
 
-                    // Subtitle caption under eyes
                     Text(
                         text = if (faceTrackingState.faceDetected) {
-                            "已锁定人脸 (${(faceTrackingState.faceX * 100).toInt()}%, ${(faceTrackingState.faceY * 100).toInt()}%) · 视线实时跟随中"
+                            "${faceTrackingState.trackingSource} (${(faceTrackingState.faceX * 100).toInt()}%, ${(faceTrackingState.faceY * 100).toInt()}%)"
                         } else {
                             companionMode.subtitle
                         },
@@ -475,7 +577,6 @@ private fun DingTalkEvaLandscapeLayout(
 
                     Spacer(Modifier.height(6.dp))
 
-                    // Mint-emerald action buttons (like eva4.jpg's green capsule button)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -523,14 +624,12 @@ private fun DingTalkEvaLandscapeLayout(
                     }
                 }
 
-                // Right Pane (56%): DingTalk Office Collaboration Card + Quick Prompt Chips + Composer
                 Column(
                     modifier = Modifier
                         .weight(0.56f)
                         .fillMaxHeight(),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    // Quick horizontal office scenario chips
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -551,7 +650,6 @@ private fun DingTalkEvaLandscapeLayout(
                         }
                     }
 
-                    // Main dark rounded card for task progress & structured results (replicates eva4.jpg right pane)
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -591,7 +689,6 @@ private fun DingTalkEvaLandscapeLayout(
                         NoticeBanner(notice = notice, onDismiss = onDismissNotice)
                     }
 
-                    // Compact input bar for landscape right pane
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -816,7 +913,6 @@ private fun EvaControlHeaderBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Left pill: Pure Eyes toggle
             Surface(
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
@@ -845,7 +941,6 @@ private fun EvaControlHeaderBar(
                 }
             }
 
-            // Right pill: Camera Face Tracking status & radar + Demo Mode label
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -875,7 +970,6 @@ private fun EvaControlHeaderBar(
             }
         }
 
-        // Second mini bar: DingTalk Eva 3 States + 3 Eye Styles + Landscape/Portrait switch
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -929,7 +1023,6 @@ private fun FaceTrackingStatusPill(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Live 2D mini radar showing detected face coordinates
             Canvas(modifier = Modifier.size(14.dp)) {
                 drawCircle(
                     color = Color(0xFF1A2636),

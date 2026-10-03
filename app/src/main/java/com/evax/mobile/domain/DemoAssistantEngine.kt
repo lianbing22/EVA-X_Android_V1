@@ -10,10 +10,14 @@ class DemoAssistantEngine(
     override fun respond(prompt: String): Flow<AssistantEvent> = flow {
         when {
             prompt.contains("会议") || prompt.contains("纪要") -> emitMeetingSummary()
-            prompt.contains("安排") || prompt.contains("下午") -> emitSchedule()
+            prompt.contains("安排") || prompt.contains("下午") || prompt.contains("日程") -> emitSchedule()
             prompt.contains("屏幕") || prompt.contains("截屏") -> emitScreenAnalysis()
             prompt.contains("Agent", ignoreCase = true) || prompt.contains("电脑") -> emitAgentStatus()
-            else -> emitFallback()
+            prompt.contains("发消息") || prompt.contains("钉钉") || prompt.contains("通知") || prompt.contains("联系") ->
+                emitDingTalkMessage(prompt)
+            prompt.contains("方案") || prompt.contains("周报") || prompt.contains("报告") || prompt.contains("表格") || prompt.contains("文档") ->
+                emitDocumentCreation(prompt)
+            else -> emitFallback(prompt)
         }
     }
 
@@ -86,12 +90,60 @@ class DemoAssistantEngine(
         )
     }
 
-    private suspend fun kotlinx.coroutines.flow.FlowCollector<AssistantEvent>.emitFallback() {
+    private suspend fun kotlinx.coroutines.flow.FlowCollector<AssistantEvent>.emitDingTalkMessage(prompt: String) {
+        val steps = listOf("解析钉钉联系人与语境", "生成待发送消息卡片")
+        steps.forEachIndexed { index, step ->
+            emit(AssistantEvent.Progress(step, index + 1, steps.size))
+            delay(stepDelayMillis)
+        }
         emit(
             AssistantEvent.Completed(
                 AssistantResult(
-                    text = "当前演示版仅支持办公问答和会议纪要整理演示。你可以试试“查今天的安排”或“整理会议纪要”。",
+                    text = "已为你准备好钉钉协同指令：「$prompt」。确认后将通过电脑端千问办公自动发送。",
                     sampleLabel = SAMPLE_LABEL,
+                    followUps = listOf(
+                        "确认立即发送该钉钉消息",
+                        "同时在日历中添加跟进提醒",
+                    ),
+                ),
+            ),
+        )
+    }
+
+    private suspend fun kotlinx.coroutines.flow.FlowCollector<AssistantEvent>.emitDocumentCreation(prompt: String) {
+        val steps = listOf("检索工作区上下文", "生成结构化文档与表格")
+        steps.forEachIndexed { index, step ->
+            emit(AssistantEvent.Progress(step, index + 1, steps.size))
+            delay(stepDelayMillis)
+        }
+        emit(
+            AssistantEvent.Completed(
+                AssistantResult(
+                    text = "已根据你的语音指令「$prompt」在电脑端生成初稿文档，并同步至千问办公工作台。",
+                    sampleLabel = SAMPLE_LABEL,
+                    followUps = listOf(
+                        "在电脑端打开并预览文档",
+                        "一键转发至项目群讨论",
+                    ),
+                ),
+            ),
+        )
+    }
+
+    private suspend fun kotlinx.coroutines.flow.FlowCollector<AssistantEvent>.emitFallback(prompt: String) {
+        emit(
+            AssistantEvent.Progress("理解语音指令并同步工作台", 1, 1),
+        )
+        delay(stepDelayMillis / 2)
+        emit(
+            AssistantEvent.Completed(
+                AssistantResult(
+                    text = "已收到你的指令：「$prompt」。当前本地演示支持办公问答、会议纪要整理及电脑协同演示，你可以试试说“查今天的安排”或“整理会议纪要”。",
+                    sampleLabel = SAMPLE_LABEL,
+                    followUps = listOf(
+                        "试试说：今天下午有什么安排",
+                        "试试说：帮我整理刚才的会议纪要",
+                    ),
                 ),
             ),
         )
