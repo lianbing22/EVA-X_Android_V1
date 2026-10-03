@@ -98,6 +98,7 @@ fun ConversationScreen(
     onMicTap: () -> Unit,
     onSpeakLatest: () -> Unit,
     onStopSpeaking: () -> Unit,
+    onCycleSpeechRate: () -> Unit = {},
     faceTrackingState: FaceTrackingState = FaceTrackingState(),
     onToggleCameraTracking: () -> Unit = {},
     onToggleOrientation: () -> Unit = {},
@@ -160,9 +161,10 @@ fun ConversationScreen(
         else -> Color.Transparent
     }
 
-    LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) {
-            conversationListState.animateScrollToItem(state.messages.lastIndex)
+    LaunchedEffect(state.messages.size, state.streamingReply) {
+        val totalCount = conversationListState.layoutInfo.totalItemsCount
+        if (totalCount > 0) {
+            runCatching { conversationListState.animateScrollToItem(totalCount - 1) }
         }
     }
 
@@ -219,6 +221,7 @@ fun ConversationScreen(
                     activeFaceOffset = activeFaceOffset,
                     onToggleCameraTracking = onToggleCameraTracking,
                     onToggleOrientation = onToggleOrientation,
+                    onCycleSpeechRate = onCycleSpeechRate,
                     hudGradientBorder = hudGradientBorder,
                     noticeDismissed = noticeDismissed,
                     onDismissNotice = { noticeDismissed = true },
@@ -249,6 +252,7 @@ fun ConversationScreen(
                     activeFaceOffset = activeFaceOffset,
                     onToggleCameraTracking = onToggleCameraTracking,
                     onToggleOrientation = onToggleOrientation,
+                    onCycleSpeechRate = onCycleSpeechRate,
                     hudGradientBorder = hudGradientBorder,
                     noticeDismissed = noticeDismissed,
                     onDismissNotice = { noticeDismissed = true },
@@ -417,6 +421,7 @@ private fun DingTalkEvaLandscapeLayout(
     activeFaceOffset: Offset?,
     onToggleCameraTracking: () -> Unit,
     onToggleOrientation: () -> Unit,
+    onCycleSpeechRate: () -> Unit,
     hudGradientBorder: Brush,
     noticeDismissed: Boolean,
     onDismissNotice: () -> Unit,
@@ -443,6 +448,9 @@ private fun DingTalkEvaLandscapeLayout(
             onToggleCameraTracking = onToggleCameraTracking,
             isLandscape = true,
             onToggleOrientation = onToggleOrientation,
+            speechRate = state.voicePlayback.speechRate,
+            lastLatencyMs = state.lastLatencyMs,
+            onCycleSpeechRate = onCycleSpeechRate,
         )
 
         Spacer(Modifier.height(6.dp))
@@ -486,6 +494,8 @@ private fun DingTalkEvaLandscapeLayout(
                         .padding(horizontal = 12.dp),
                 ) {
                     val subtitleText = when {
+                        !state.streamingReply.isNullOrBlank() ->
+                            "「${state.streamingReply}」"
                         state.phase == AssistantPhase.LISTENING && state.draft.isNotBlank() ->
                             "「正在听你说：${state.draft}…」"
                         companionMode != EvaCompanionMode.COMPANION ->
@@ -636,17 +646,20 @@ private fun DingTalkEvaLandscapeLayout(
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
+                        LandscapeQuickChip("DSH 项目工作台", enabled = !state.isProcessing) {
+                            onSubmit("查看一下电脑上的DSH项目工作台和飞书成果状态")
+                        }
+                        LandscapeQuickChip("建交付任务", enabled = !state.isProcessing) {
+                            onSubmit("帮我建个交付任务：自动检查EVA-X网关与桌面伴侣状态")
+                        }
                         LandscapeQuickChip("查今天的安排", enabled = !state.isProcessing) {
                             onSubmit("查今天的安排")
                         }
                         LandscapeQuickChip("整理会议纪要", enabled = !state.isProcessing) {
                             onSubmit("整理会议纪要")
                         }
-                        LandscapeQuickChip("截取电脑屏幕", enabled = !state.isProcessing) {
-                            onSubmit("截取电脑屏幕")
-                        }
-                        LandscapeQuickChip("电脑 Agent 状态", enabled = !state.isProcessing) {
-                            onSubmit("电脑 Agent 状态")
+                        LandscapeQuickChip("检查电脑状态", enabled = !state.isProcessing) {
+                            onSubmit("检查电脑运行状态")
                         }
                     }
 
@@ -672,13 +685,21 @@ private fun DingTalkEvaLandscapeLayout(
                                 state = conversationListState,
                                 verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                if (state.messages.isEmpty()) {
+                                if (state.messages.isEmpty() && state.streamingReply.isNullOrBlank()) {
                                     item(key = "greeting") {
                                         HudGreetingContent()
                                     }
                                 } else {
                                     items(state.messages, key = ConversationMessage::id) { message ->
                                         HudMessageCard(message)
+                                    }
+                                    if (!state.streamingReply.isNullOrBlank()) {
+                                        item(key = "streaming-reply") {
+                                            HudStreamingReplyCard(
+                                                text = state.streamingReply,
+                                                latencyMs = state.lastLatencyMs,
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -699,7 +720,7 @@ private fun DingTalkEvaLandscapeLayout(
                             modifier = Modifier.weight(1f),
                             placeholder = {
                                 Text(
-                                    text = "一句话交给 Eva 执行（如：整理会议纪要）…",
+                                    text = "一句话交给电脑 DSH/WorkBuddy 执行或实时对话…",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = Color(0xFF7D899E),
                                 )
@@ -772,6 +793,7 @@ private fun PortraitHudLayout(
     activeFaceOffset: Offset?,
     onToggleCameraTracking: () -> Unit,
     onToggleOrientation: () -> Unit,
+    onCycleSpeechRate: () -> Unit,
     hudGradientBorder: Brush,
     noticeDismissed: Boolean,
     onDismissNotice: () -> Unit,
@@ -799,6 +821,9 @@ private fun PortraitHudLayout(
             onToggleCameraTracking = onToggleCameraTracking,
             isLandscape = false,
             onToggleOrientation = onToggleOrientation,
+            speechRate = state.voicePlayback.speechRate,
+            lastLatencyMs = state.lastLatencyMs,
+            onCycleSpeechRate = onCycleSpeechRate,
         )
 
         Spacer(Modifier.height(6.dp))
@@ -847,13 +872,21 @@ private fun PortraitHudLayout(
                         state = conversationListState,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        if (state.messages.isEmpty()) {
+                        if (state.messages.isEmpty() && state.streamingReply.isNullOrBlank()) {
                             item(key = "greeting") {
                                 HudGreetingContent()
                             }
                         } else {
                             items(state.messages, key = ConversationMessage::id) { message ->
                                 HudMessageCard(message)
+                            }
+                            if (!state.streamingReply.isNullOrBlank()) {
+                                item(key = "streaming-reply") {
+                                    HudStreamingReplyCard(
+                                        text = state.streamingReply,
+                                        latencyMs = state.lastLatencyMs,
+                                    )
+                                }
                             }
                         }
                     }
@@ -905,6 +938,9 @@ private fun EvaControlHeaderBar(
     onToggleCameraTracking: () -> Unit,
     isLandscape: Boolean,
     onToggleOrientation: () -> Unit,
+    speechRate: Float = 1.25f,
+    lastLatencyMs: Long? = null,
+    onCycleSpeechRate: () -> Unit = {},
 ) {
     val dotColor = phaseAccentColor(phase)
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -977,6 +1013,18 @@ private fun EvaControlHeaderBar(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            MiniSwitchPill(
+                label = "语速: ${String.format("%.2fx", speechRate)}",
+                accent = EvaMint,
+                onClick = onCycleSpeechRate,
+            )
+            if (lastLatencyMs != null) {
+                MiniSwitchPill(
+                    label = "⚡ 首句 ${lastLatencyMs}ms",
+                    accent = HudCyan,
+                    onClick = {},
+                )
+            }
             MiniSwitchPill(
                 label = "状态: ${companionMode.title}",
                 accent = EvaMint,
@@ -1201,9 +1249,11 @@ private fun HudProgressSection(steps: List<String>) {
                 )
             }
         }
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(5.dp))
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -1220,6 +1270,8 @@ private fun HudProgressSection(steps: List<String>) {
                         text = step,
                         style = MaterialTheme.typography.labelSmall,
                         color = Color(0xFFD5DFEE),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
@@ -1308,12 +1360,25 @@ private fun HudMessageCard(message: ConversationMessage) {
                     )
                 }
                 if (message.isSample) {
-                    Text(
-                        text = "演示数据",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = EvaMint,
-                        fontWeight = FontWeight.Medium,
-                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (message.sampleLabel != "演示数据") {
+                            Text(
+                                text = message.sampleLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = HudCyan,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                        Text(
+                            text = "演示数据",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EvaMint,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
                 }
             }
             Spacer(Modifier.height(5.dp))
@@ -1340,6 +1405,48 @@ private fun HudMessageCard(message: ConversationMessage) {
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun HudStreamingReplyCard(
+    text: String,
+    latencyMs: Long?,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFF0E1D24),
+        border = BorderStroke(1.2.dp, EvaMint.copy(alpha = 0.7f)),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "⚡ EVA-X 实时流式语音回复中…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = EvaMint,
+                    fontWeight = FontWeight.Bold,
+                )
+                if (latencyMs != null && latencyMs > 0L) {
+                    Text(
+                        text = "首句 ${latencyMs}ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = HudCyan,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+            Spacer(Modifier.height(5.dp))
+            Text(
+                text = "$text ▍",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(0xFFF2FBF7),
+            )
         }
     }
 }
@@ -1387,19 +1494,19 @@ private fun PcControlDeck(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 DeckActionTile(
-                    title = "截取电脑屏幕",
+                    title = "DSH 项目工作台",
                     iconType = DeckIconType.MONITOR,
                     enabled = enabled,
                     compact = compact,
-                    onClick = { onSubmit("截取电脑屏幕") },
+                    onClick = { onSubmit("查看一下电脑上的DSH项目工作台和飞书成果状态") },
                     modifier = Modifier.weight(1f),
                 )
                 DeckActionTile(
-                    title = "电脑 Agent 状态",
+                    title = "建 DSH 交付任务",
                     iconType = DeckIconType.BOLT,
                     enabled = enabled,
                     compact = compact,
-                    onClick = { onSubmit("电脑 Agent 状态") },
+                    onClick = { onSubmit("帮我建个交付任务：自动检查EVA-X网关与桌面伴侣状态") },
                     modifier = Modifier.weight(1f),
                 )
             }

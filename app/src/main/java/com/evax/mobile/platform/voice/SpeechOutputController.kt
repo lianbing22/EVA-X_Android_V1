@@ -8,6 +8,14 @@ interface SpeechOutputController {
 
     fun speak(text: String)
 
+    fun speakChunk(text: String, flush: Boolean = false) {
+        speak(text)
+    }
+
+    fun setSpeechRate(rate: Float) {}
+
+    fun cycleSpeechRate(): Float = state.value.speechRate
+
     fun stop()
 
     fun shutdown()

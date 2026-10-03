@@ -26,7 +26,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import com.evax.mobile.domain.AssistantEngine
 import com.evax.mobile.domain.DemoAssistantEngine
+import com.evax.mobile.domain.GatewayAssistantEngine
 import com.evax.mobile.domain.SpeechInputFailure
 import com.evax.mobile.platform.vision.CameraFaceTracker
 import com.evax.mobile.platform.voice.AndroidSpeechInputController
@@ -40,7 +42,19 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val conversationViewModel: ConversationViewModel by viewModels {
-        ConversationViewModelFactory(DemoAssistantEngine())
+        val activeEngine: AssistantEngine = if (isRunningInstrumentationTest()) {
+            DemoAssistantEngine()
+        } else {
+            GatewayAssistantEngine(fallbackEngine = DemoAssistantEngine())
+        }
+        ConversationViewModelFactory(
+            engine = activeEngine,
+            onSpeakChunk = { sentence, isFirst ->
+                if (::speechOutputController.isInitialized) {
+                    speechOutputController.speakChunk(sentence, flush = isFirst)
+                }
+            },
+        )
     }
 
     private lateinit var speechInputController: AndroidSpeechInputController
@@ -154,6 +168,7 @@ class MainActivity : ComponentActivity() {
                             ?.let { speechOutputController.speak(it.text) }
                     },
                     onStopSpeaking = speechOutputController::stop,
+                    onCycleSpeechRate = { speechOutputController.cycleSpeechRate() },
                     faceTrackingState = faceTrackingState,
                     onToggleCameraTracking = {
                         when {
@@ -221,6 +236,9 @@ class MainActivity : ComponentActivity() {
         onUpdateMicLevel: (Float) -> Unit,
         onOpenLiveSheetFallback: () -> Unit,
     ) {
+        if (::speechOutputController.isInitialized) {
+            speechOutputController.stop()
+        }
         conversationViewModel.onListeningStarted()
         speechInputController.start(
             onResult = conversationViewModel::onSpeechResult,
@@ -235,9 +253,7 @@ class MainActivity : ComponentActivity() {
             },
             onFailure = { failure ->
                 if (failure == SpeechInputFailure.SERVICE_UNAVAILABLE || failure == SpeechInputFailure.UNKNOWN) {
-                    // Fallback 2: Launch system RecognizerIntent.ACTION_RECOGNIZE_SPEECH dialog if available
                     if (!tryLaunchSystemSpeechDialog(systemSpeechLauncher)) {
-                        // Fallback 3: Open built-in Real Audio Mic Monitor + Live Voice Dictation Sheet
                         onOpenLiveSheetFallback()
                     }
                 } else {
@@ -280,13 +296,14 @@ class MainActivity : ComponentActivity() {
 }
 
 private class ConversationViewModelFactory(
-    private val engine: DemoAssistantEngine,
+    private val engine: AssistantEngine,
+    private val onSpeakChunk: ((sentence: String, isFirst: Boolean) -> Unit)? = null,
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (!modelClass.isAssignableFrom(ConversationViewModel::class.java)) {
             throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
         }
-        return ConversationViewModel(engine) as T
+        return ConversationViewModel(engine = engine, onSpeakChunk = onSpeakChunk) as T
     }
 }

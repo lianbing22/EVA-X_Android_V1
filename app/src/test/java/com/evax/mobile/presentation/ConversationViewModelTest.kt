@@ -186,6 +186,35 @@ class ConversationViewModelTest {
         assertFalse(viewModel.uiState.value.isProcessing)
         assertTrue(viewModel.uiState.value.notice.orEmpty().isNotBlank())
     }
+
+    @Test
+    fun streamingEventsTriggerSentenceSpeechAndLatency() = runTest(mainDispatcherRule.dispatcher) {
+        val spokenChunks = mutableListOf<Pair<String, Boolean>>()
+        val streamingVm = ConversationViewModel(
+            engine = engine,
+            onSpeakChunk = { sentence, isFirst -> spokenChunks += sentence to isFirst },
+        )
+        engine.response = {
+            flowOf(
+                AssistantEvent.Progress("连接 WorkBuddy 极速模型流…", 1, 2),
+                AssistantEvent.StreamDelta("你好，", "你好，"),
+                AssistantEvent.SpeakSentence("你好，我已经连上Mac了！", isFirst = true, latencyMs = 580L),
+                AssistantEvent.StreamDelta("我已经连上Mac了！随时待命。", "你好，我已经连上Mac了！随时待命。"),
+                AssistantEvent.SpeakSentence("随时待命。", isFirst = false, latencyMs = 920L),
+                AssistantEvent.Completed(AssistantResult("你好，我已经连上Mac了！随时待命。", "WorkBuddy·GLM-5.3-Flash · 首句 580ms")),
+            )
+        }
+
+        streamingVm.submitPrompt("你好")
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("你好，我已经连上Mac了！" to true, "随时待命。" to false),
+            spokenChunks,
+        )
+        assertEquals(580L, streamingVm.uiState.value.lastLatencyMs)
+        assertEquals(AssistantPhase.COMPLETED, streamingVm.uiState.value.phase)
+    }
 }
 
 private class RecordingAssistantEngine : AssistantEngine {

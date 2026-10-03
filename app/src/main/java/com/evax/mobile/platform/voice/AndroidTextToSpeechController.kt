@@ -6,6 +6,7 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import com.evax.mobile.presentation.VoicePlaybackState
+import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,14 +15,15 @@ import kotlinx.coroutines.flow.update
 
 class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val mutableState = MutableStateFlow(VoicePlaybackState())
+    private val mutableState = MutableStateFlow(VoicePlaybackState(speechRate = 1.25f))
     private val utteranceSequence = AtomicLong(0)
+    private val activeUtterances = Collections.synchronizedSet( linkedSetOf<String>() )
 
     @Volatile
     private var textToSpeech: TextToSpeech? = null
 
     @Volatile
-    private var activeUtteranceId: String? = null
+    private var currentSpeechRate: Float = 1.25f
 
     @Volatile
     private var isShutdown = false
@@ -35,22 +37,60 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
     }
 
     override fun speak(text: String) {
+        speakChunk(text, flush = true)
+    }
+
+    override fun speakChunk(text: String, flush: Boolean) {
         onMain {
             val engine = textToSpeech ?: return@onMain
-            if (isShutdown || !mutableState.value.isReady || text.isBlank()) return@onMain
+            val cleaned = text.trim()
+            if (isShutdown || !mutableState.value.isReady || cleaned.isBlank()) return@onMain
+
+            runCatching {
+                engine.setSpeechRate(currentSpeechRate)
+                engine.setPitch(1.03f)
+            }
+
+            if (flush) {
+                activeUtterances.clear()
+            }
             val utteranceId = "eva-${utteranceSequence.incrementAndGet()}"
-            activeUtteranceId = utteranceId
-            val result = engine.speak(text.trim(), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+            activeUtterances.add(utteranceId)
+            mutableState.update { it.copy(isSpeaking = true, speechRate = currentSpeechRate) }
+
+            val queueMode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            val result = engine.speak(cleaned, queueMode, null, utteranceId)
             if (result == TextToSpeech.ERROR) {
-                activeUtteranceId = null
-                mutableState.update { it.copy(isSpeaking = false) }
+                activeUtterances.remove(utteranceId)
+                if (activeUtterances.isEmpty()) {
+                    mutableState.update { it.copy(isSpeaking = false) }
+                }
             }
         }
     }
 
+    override fun setSpeechRate(rate: Float) {
+        val clamped = rate.coerceIn(0.8f, 2.0f)
+        currentSpeechRate = clamped
+        onMain {
+            runCatching { textToSpeech?.setSpeechRate(clamped) }
+            mutableState.update { it.copy(speechRate = clamped) }
+        }
+    }
+
+    override fun cycleSpeechRate(): Float {
+        val next = when {
+            currentSpeechRate < 1.15f -> 1.25f
+            currentSpeechRate < 1.40f -> 1.50f
+            else -> 1.00f
+        }
+        setSpeechRate(next)
+        return next
+    }
+
     override fun stop() {
         onMain {
-            activeUtteranceId = null
+            activeUtterances.clear()
             runCatching { textToSpeech?.stop() }
             mutableState.update { it.copy(isSpeaking = false) }
         }
@@ -60,12 +100,12 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
         onMain {
             if (isShutdown) return@onMain
             isShutdown = true
-            activeUtteranceId = null
+            activeUtterances.clear()
             val engine = textToSpeech
             textToSpeech = null
             runCatching { engine?.stop() }
             engine?.shutdown()
-            mutableState.value = VoicePlaybackState()
+            mutableState.value = VoicePlaybackState(speechRate = currentSpeechRate)
         }
     }
 
@@ -73,7 +113,7 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
         if (isShutdown) return
         val engine = textToSpeech
         if (status != TextToSpeech.SUCCESS || engine == null) {
-            mutableState.value = VoicePlaybackState()
+            mutableState.value = VoicePlaybackState(speechRate = currentSpeechRate)
             return
         }
 
@@ -81,21 +121,35 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
             .getOrDefault(TextToSpeech.LANG_NOT_SUPPORTED)
         val ready = languageStatus >= TextToSpeech.LANG_AVAILABLE
         if (ready) {
+            runCatching {
+                engine.setSpeechRate(currentSpeechRate)
+                engine.setPitch(1.03f)
+            }
             engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = updateSpeaking(utteranceId, true)
-                override fun onDone(utteranceId: String?) = updateSpeaking(utteranceId, false)
-                override fun onError(utteranceId: String?) = updateSpeaking(utteranceId, false)
-                override fun onError(utteranceId: String?, errorCode: Int) = updateSpeaking(utteranceId, false)
+                override fun onStart(utteranceId: String?) = onUtteranceStart(utteranceId)
+                override fun onDone(utteranceId: String?) = onUtteranceFinished(utteranceId)
+                override fun onError(utteranceId: String?) = onUtteranceFinished(utteranceId)
+                override fun onError(utteranceId: String?, errorCode: Int) = onUtteranceFinished(utteranceId)
             })
         }
-        mutableState.value = VoicePlaybackState(isReady = ready)
+        mutableState.value = VoicePlaybackState(isReady = ready, speechRate = currentSpeechRate)
     }
 
-    private fun updateSpeaking(utteranceId: String?, isSpeaking: Boolean) {
+    private fun onUtteranceStart(utteranceId: String?) {
         onMain {
-            if (utteranceId != null && utteranceId == activeUtteranceId && !isShutdown) {
-                mutableState.update { it.copy(isSpeaking = isSpeaking) }
-                if (!isSpeaking) activeUtteranceId = null
+            if (!isShutdown && utteranceId != null && activeUtterances.contains(utteranceId)) {
+                mutableState.update { it.copy(isSpeaking = true) }
+            }
+        }
+    }
+
+    private fun onUtteranceFinished(utteranceId: String?) {
+        onMain {
+            if (utteranceId != null) {
+                activeUtterances.remove(utteranceId)
+            }
+            if (!isShutdown && activeUtterances.isEmpty()) {
+                mutableState.update { it.copy(isSpeaking = false) }
             }
         }
     }

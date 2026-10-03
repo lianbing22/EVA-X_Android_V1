@@ -23,6 +23,7 @@
         android:icon="@drawable/ic_eva_x"
         android:label="EVA-X"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.EvaX">
         <activity
             android:name=".MainActivity"

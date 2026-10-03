@@ -14,6 +14,7 @@ import kotlinx.coroutines.launch
 
 class ConversationViewModel(
     private val engine: AssistantEngine,
+    private val onSpeakChunk: ((sentence: String, isFirst: Boolean) -> Unit)? = null,
 ) : ViewModel() {
     private val mutableUiState = MutableStateFlow(ConversationUiState())
     val uiState = mutableUiState.asStateFlow()
@@ -43,6 +44,7 @@ class ConversationViewModel(
                 phase = AssistantPhase.THINKING,
                 currentStep = null,
                 progressSteps = emptyList(),
+                streamingReply = null,
                 notice = null,
                 isProcessing = true,
             )
@@ -50,6 +52,7 @@ class ConversationViewModel(
 
         viewModelScope.launch {
             var receivedResult = false
+            var spokeStreamingSentence = false
             try {
                 engine.respond(prompt).collect { event ->
                     when (event) {
@@ -67,8 +70,30 @@ class ConversationViewModel(
                             }
                         }
 
+                        is AssistantEvent.StreamDelta -> {
+                            mutableUiState.update { state ->
+                                if (!state.isProcessing) state else state.copy(
+                                    phase = AssistantPhase.EXECUTING,
+                                    streamingReply = event.partialText,
+                                )
+                            }
+                        }
+
+                        is AssistantEvent.SpeakSentence -> {
+                            spokeStreamingSentence = true
+                            onSpeakChunk?.invoke(event.sentence, event.isFirst)
+                            if (event.isFirst && event.latencyMs > 0L) {
+                                mutableUiState.update { state ->
+                                    state.copy(lastLatencyMs = event.latencyMs)
+                                }
+                            }
+                        }
+
                         is AssistantEvent.Completed -> {
                             receivedResult = true
+                            if (!spokeStreamingSentence && event.result.text.isNotBlank()) {
+                                onSpeakChunk?.invoke(event.result.text, true)
+                            }
                             mutableUiState.update { state ->
                                 if (!state.isProcessing) state else state.copy(
                                     messages = state.messages + ConversationMessage(
@@ -76,10 +101,13 @@ class ConversationViewModel(
                                         role = MessageRole.ASSISTANT,
                                         text = event.result.text,
                                         isSample = true,
+                                        sampleLabel = event.result.sampleLabel,
                                         followUps = event.result.followUps,
                                     ),
                                     phase = AssistantPhase.COMPLETED,
                                     currentStep = null,
+                                    streamingReply = null,
+                                    gatewayLabel = event.result.sampleLabel,
                                     notice = null,
                                     isProcessing = false,
                                 )
@@ -160,6 +188,7 @@ class ConversationViewModel(
             state.copy(
                 phase = AssistantPhase.ERROR,
                 currentStep = null,
+                streamingReply = null,
                 notice = message,
                 isProcessing = false,
             )
