@@ -1,7 +1,9 @@
 package com.evax.mobile
 
 import android.Manifest
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -21,13 +23,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import com.evax.mobile.domain.DemoAssistantEngine
 import com.evax.mobile.domain.SpeechInputFailure
+import com.evax.mobile.platform.vision.CameraFaceTracker
 import com.evax.mobile.platform.voice.AndroidSpeechInputController
 import com.evax.mobile.platform.voice.AndroidTextToSpeechController
 import com.evax.mobile.presentation.ConversationViewModel
 import com.evax.mobile.presentation.MessageRole
 import com.evax.mobile.ui.ConversationScreen
 import com.evax.mobile.ui.theme.EvaXTheme
-import kotlinx.coroutines.flow.collect
 
 class MainActivity : ComponentActivity() {
     private val conversationViewModel: ConversationViewModel by viewModels {
@@ -36,19 +38,23 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var speechInputController: AndroidSpeechInputController
     private lateinit var speechOutputController: AndroidTextToSpeechController
+    private lateinit var cameraFaceTracker: CameraFaceTracker
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         speechInputController = AndroidSpeechInputController(applicationContext)
         speechOutputController = AndroidTextToSpeechController(applicationContext)
+        cameraFaceTracker = CameraFaceTracker(applicationContext)
 
         setContent {
             EvaXTheme {
                 val uiState by conversationViewModel.uiState.collectAsStateWithLifecycle()
+                val faceTrackingState by cameraFaceTracker.state.collectAsStateWithLifecycle()
                 var permissionWasDenied by rememberSaveable { mutableStateOf(false) }
+                var cameraPromptedOnLaunch by rememberSaveable { mutableStateOf(false) }
 
-                val permissionLauncher = rememberLauncherForActivityResult(
+                val micPermissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestPermission(),
                 ) { isGranted ->
                     if (isGranted) {
@@ -57,6 +63,26 @@ class MainActivity : ComponentActivity() {
                     } else {
                         permissionWasDenied = true
                         conversationViewModel.onSpeechFailure(SpeechInputFailure.PERMISSION_DENIED)
+                    }
+                }
+
+                val cameraPermissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestPermission(),
+                ) { isGranted ->
+                    cameraFaceTracker.onPermissionChanged(isGranted)
+                    if (isGranted) {
+                        cameraFaceTracker.start()
+                    }
+                }
+
+                LaunchedEffect(Unit) {
+                    val hasCam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                    cameraFaceTracker.onPermissionChanged(hasCam)
+                    if (hasCam) {
+                        cameraFaceTracker.start()
+                    } else if (!cameraPromptedOnLaunch && !isRunningInstrumentationTest()) {
+                        cameraPromptedOnLaunch = true
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
                     }
                 }
 
@@ -78,7 +104,7 @@ class MainActivity : ComponentActivity() {
                             permissionWasDenied ->
                                 conversationViewModel.onSpeechFailure(SpeechInputFailure.PERMISSION_DENIED)
 
-                            else -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            else -> micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         }
                     },
                     onSpeakLatest = {
@@ -86,8 +112,39 @@ class MainActivity : ComponentActivity() {
                             ?.let { speechOutputController.speak(it.text) }
                     },
                     onStopSpeaking = speechOutputController::stop,
+                    faceTrackingState = faceTrackingState,
+                    onToggleCameraTracking = {
+                        when {
+                            checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ->
+                                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+
+                            faceTrackingState.isCameraActive ->
+                                cameraFaceTracker.stop()
+
+                            else ->
+                                cameraFaceTracker.start()
+                        }
+                    },
+                    onToggleOrientation = {
+                        val isCurrentlyLandscape =
+                            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                        requestedOrientation = if (isCurrentlyLandscape) {
+                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        } else {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        }
+                    },
                 )
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (::cameraFaceTracker.isInitialized &&
+            checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        ) {
+            cameraFaceTracker.start()
         }
     }
 
@@ -97,12 +154,14 @@ class MainActivity : ComponentActivity() {
             conversationViewModel.onListeningCancelled()
         }
         if (::speechOutputController.isInitialized) speechOutputController.stop()
+        if (::cameraFaceTracker.isInitialized) cameraFaceTracker.stop()
         super.onStop()
     }
 
     override fun onDestroy() {
         if (::speechInputController.isInitialized) speechInputController.destroy()
         if (::speechOutputController.isInitialized) speechOutputController.shutdown()
+        if (::cameraFaceTracker.isInitialized) cameraFaceTracker.stop()
         super.onDestroy()
     }
 
@@ -112,6 +171,15 @@ class MainActivity : ComponentActivity() {
             onResult = conversationViewModel::onSpeechResult,
             onFailure = conversationViewModel::onSpeechFailure,
         )
+    }
+
+    private fun isRunningInstrumentationTest(): Boolean {
+        return try {
+            Class.forName("androidx.test.espresso.Espresso")
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 }
 
