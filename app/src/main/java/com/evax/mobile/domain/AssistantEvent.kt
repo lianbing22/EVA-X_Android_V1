@@ -1,6 +1,17 @@
 package com.evax.mobile.domain
 
+enum class AssistantSource {
+    UNCONFIRMED,
+    PC_GATEWAY,
+    LOCAL_DEMO,
+}
+
 sealed interface AssistantEvent {
+    data class SourceChanged(
+        val source: AssistantSource,
+        val label: String,
+    ) : AssistantEvent
+
     data class Progress(
         val step: String,
         val index: Int,

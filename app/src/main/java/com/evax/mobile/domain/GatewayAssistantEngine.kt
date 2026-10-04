@@ -3,193 +3,302 @@ package com.evax.mobile.domain
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
+import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
-/**
- * 电脑端 DeepSeek Harness (dsh-evax-bridge) & WorkBuddy 极速流式网关引擎。
- *
- * - 自动探测并缓存最快的电脑网关地址（ADB 映射 127.0.0.1:3088 -> 模拟器 10.0.2.2:3088 -> 局域网 Wi-Fi 192.168.2.4:3088）。
- * - 实时解析 SSE 事件流（Progress / StreamDelta / SpeakSentence / Completed），首句达到即触发 TTS 朗读。
- * - 若电脑网关离线，自动无感降级至本地 DemoAssistantEngine 并同样触发首句朗读。
- */
+/** 仅连接通过配对的 WorkBuddy 官方 Open API 桥接，不自动切换到演示数据。 */
 class GatewayAssistantEngine(
-    private val fallbackEngine: AssistantEngine = DemoAssistantEngine(),
-    private val candidateEndpoints: List<String> = listOf(
-        "http://127.0.0.1:3088",
-        "http://10.0.2.2:3088",
-        "http://192.168.2.4:3088",
-    ),
+    private val configProvider: () -> GatewayConnectionConfig,
 ) : AssistantEngine {
-
-    @Volatile
-    private var preferredBaseUrl: String? = null
-
     override fun respond(prompt: String): Flow<AssistantEvent> = flow {
-        val baseUrl = resolveActiveGateway()
-        if (baseUrl != null) {
-            val streamed = tryStreamFromGateway(baseUrl, prompt) { event ->
-                emit(event)
-            }
-            if (streamed) return@flow
+        // 单次请求使用完整配置快照，保存新设置不会把正在执行的请求切到另一台电脑。
+        val config = configProvider().validated()
+        val status = checkConnection(config)
+        if (status.state != GatewayConnectionState.READY) {
+            throw GatewayException(status.errorCode ?: "connection_failed", status.message)
         }
-
-        // 电脑网关不可达时，降级到本地引擎并自动补发首句朗读事件
-        fallbackEngine.respond(prompt).collect { event ->
-            if (event is AssistantEvent.Completed) {
-                emit(
-                    AssistantEvent.SpeakSentence(
-                        sentence = event.result.text,
-                        isFirst = true,
-                        latencyMs = 15L,
-                    )
-                )
-            }
-            emit(event)
-        }
+        emit(AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "WorkBuddy 官方桥接"))
+        streamResponse(config, prompt) { emit(it) }
     }.flowOn(Dispatchers.IO)
 
-    private fun resolveActiveGateway(): String? {
-        val currentPreferred = preferredBaseUrl
-        val ordered = if (currentPreferred != null) {
-            listOf(currentPreferred) + candidateEndpoints.filterNot { it == currentPreferred }
-        } else {
-            candidateEndpoints
-        }
-
-        for (candidate in ordered) {
-            if (probeHealth(candidate)) {
-                preferredBaseUrl = candidate
-                return candidate
-            }
-        }
-        return null
-    }
-
-    private fun probeHealth(baseUrl: String): Boolean {
-        var conn: HttpURLConnection? = null
-        return try {
-            conn = (URL("$baseUrl/healthz").openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 550
-                readTimeout = 550
-                useCaches = false
-            }
-            conn.responseCode == 200
-        } catch (_: Throwable) {
-            false
-        } finally {
-            conn?.disconnect()
+    suspend fun testConnection(config: GatewayConnectionConfig): GatewayConnectionStatus = withContext(Dispatchers.IO) {
+        try {
+            checkConnection(config.validated())
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: GatewayException) {
+            GatewayConnectionStatus(
+                state = if (failure.code == "not_configured") GatewayConnectionState.UNCONFIGURED else GatewayConnectionState.ERROR,
+                message = failure.userMessage,
+                checkedAt = System.currentTimeMillis(),
+                errorCode = failure.code,
+            )
+        } catch (failure: Exception) {
+            val mapped = networkFailure(failure)
+            GatewayConnectionStatus(
+                state = GatewayConnectionState.ERROR,
+                message = mapped.userMessage,
+                checkedAt = System.currentTimeMillis(),
+                errorCode = mapped.code,
+            )
         }
     }
 
-    private suspend fun tryStreamFromGateway(
-        baseUrl: String,
+    private suspend fun checkConnection(config: GatewayConnectionConfig): GatewayConnectionStatus {
+        val health = getJson(config, "/healthz", authenticated = false)
+        if (!health.optBoolean("ok") || health.optString("protocol") != PROTOCOL) {
+            throw GatewayException("protocol_mismatch", "该地址不是 EVA-X WorkBuddy 官方桥接，请检查电脑桥接地址（默认端口 3099）。")
+        }
+        val json = getJson(config, "/api/connection", authenticated = true)
+        if (json.optString("provider") != "workbuddy") {
+            throw GatewayException("protocol_mismatch", "连接状态不是 WorkBuddy，无法提交真实电脑任务。")
+        }
+        val configured = json.optBoolean("configured")
+        val authorized = json.optBoolean("authorized")
+        val online = json.optBoolean("online")
+        val reportedState = json.optString("state")
+        val code = when {
+            !configured -> "unconfigured"
+            !authorized -> "unauthorized"
+            !online -> "offline"
+            reportedState == "busy" -> "busy"
+            reportedState == "attention" -> "NEEDS_ATTENTION"
+            reportedState != "online" -> "connection_failed"
+            else -> null
+        }
+        return GatewayConnectionStatus(
+            state = if (code == null) GatewayConnectionState.READY else GatewayConnectionState.ERROR,
+            message = if (code == null) "WorkBuddy 已授权且在线，可以提交指令" else errorForCode(code, json.optString("message"), config).userMessage,
+            configured = configured,
+            authorized = authorized,
+            online = online,
+            checkedAt = System.currentTimeMillis(),
+            errorCode = code,
+        )
+    }
+
+    private suspend fun getJson(config: GatewayConnectionConfig, path: String, authenticated: Boolean): JSONObject {
+        try {
+            return withConnection(config, path, authenticated) { connection ->
+                connection.requestMethod = "GET"
+                connection.readTimeout = if (path == "/api/connection") 35_000 else 3_000
+                connection.setRequestProperty("Accept", "application/json")
+                requireSuccessfulHttp(connection, config)
+                val text = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                try {
+                    JSONObject(text)
+                } catch (_: Exception) {
+                    throw GatewayException("protocol_mismatch", "电脑桥接返回了无效的连接信息，请检查桥接版本。")
+                }
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: GatewayException) {
+            throw failure
+        } catch (failure: Exception) {
+            currentCoroutineContext().ensureActive()
+            throw networkFailure(failure)
+        }
+    }
+
+    private suspend fun streamResponse(
+        config: GatewayConnectionConfig,
         prompt: String,
         onEvent: suspend (AssistantEvent) -> Unit,
-    ): Boolean {
-        var conn: HttpURLConnection? = null
+    ) {
+        var receivedOutput = false
         var receivedCompleted = false
-        return try {
-            conn = (URL("$baseUrl/api/evax/stream").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 1500
-                readTimeout = 25000
-                useCaches = false
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                setRequestProperty("Accept", "text/event-stream")
-            }
-
-            val payload = JSONObject().apply {
-                put("prompt", prompt)
-            }.toString()
-
-            conn.outputStream.use { out ->
-                out.write(payload.toByteArray(Charsets.UTF_8))
-                out.flush()
-            }
-
-            if (conn.responseCode != 200) return false
-
-            BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { reader ->
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    val trimmed = line?.trim().orEmpty()
-                    if (!trimmed.startsWith("data:")) continue
-                    val dataStr = trimmed.removePrefix("data:").trim()
-                    if (dataStr == "[DONE]" || dataStr.isEmpty()) continue
-
-                    val json = runCatching { JSONObject(dataStr) }.getOrNull() ?: continue
-                    when (json.optString("type")) {
-                        "progress" -> {
-                            onEvent(
-                                AssistantEvent.Progress(
-                                    step = json.optString("step", "处理中…"),
-                                    index = json.optInt("index", 1),
-                                    total = json.optInt("total", 2),
-                                )
-                            )
+        var requestMayHaveReachedBridge = false
+        try {
+            withConnection(config, "/api/evax/stream", authenticated = true) { connection ->
+                connection.requestMethod = "POST"
+                connection.doOutput = true
+                connection.readTimeout = 25_000
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                connection.setRequestProperty("Accept", "text/event-stream")
+                val payload = JSONObject().apply {
+                    put("prompt", prompt)
+                    put("requestId", UUID.randomUUID().toString())
+                }.toString()
+                connection.outputStream.use {
+                    requestMayHaveReachedBridge = true
+                    it.write(payload.toByteArray(Charsets.UTF_8))
+                }
+                requireSuccessfulHttp(connection, config)
+                if (!connection.contentType.orEmpty().lowercase().startsWith("text/event-stream")) {
+                    throw GatewayException("unconfirmed_response", "电脑桥接没有返回指令事件流，无法确认指令结果。请先查看电脑端状态，不要重复提交。")
+                }
+                BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8)).use { reader ->
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        currentCoroutineContext().ensureActive()
+                        val trimmed = line.trim()
+                        // 空行和 SSE 注释心跳不代表任务结果。
+                        if (!trimmed.startsWith("data:")) continue
+                        val data = trimmed.removePrefix("data:").trim()
+                        if (data.isEmpty() || data == "[DONE]") continue
+                        val json = try {
+                            JSONObject(data)
+                        } catch (_: Exception) {
+                            throw GatewayException("invalid_event", "电脑桥接返回了无效的指令事件，未确认执行结果。")
                         }
-
-                        "delta" -> {
-                            onEvent(
-                                AssistantEvent.StreamDelta(
-                                    delta = json.optString("delta", ""),
-                                    partialText = json.optString("partialText", ""),
-                                )
-                            )
-                        }
-
-                        "sentence" -> {
-                            val sentence = json.optString("sentence", "").trim()
-                            if (sentence.isNotEmpty()) {
-                                onEvent(
-                                    AssistantEvent.SpeakSentence(
-                                        sentence = sentence,
-                                        isFirst = json.optBoolean("isFirst", false),
-                                        latencyMs = json.optLong("latencyMs", 0L),
-                                    )
-                                )
+                        when (json.optString("type")) {
+                            "progress" -> {
+                                receivedOutput = true
+                                onEvent(AssistantEvent.Progress(json.optString("step", "处理中…"), json.optInt("index"), json.optInt("total")))
                             }
-                        }
-
-                        "completed" -> {
-                            val text = json.optString("text", "").trim()
-                            val sampleLabel = json.optString("sampleLabel", "PC · DSH+WorkBuddy")
-                            val followUpsJson: JSONArray? = json.optJSONArray("followUps")
-                            val followUps = buildList {
-                                if (followUpsJson != null) {
-                                    for (i in 0 until followUpsJson.length()) {
-                                        val item = followUpsJson.optString(i).trim()
-                                        if (item.isNotEmpty()) add(item)
-                                    }
+                            "delta" -> {
+                                receivedOutput = true
+                                onEvent(AssistantEvent.StreamDelta(json.optString("delta"), json.optString("partialText")))
+                            }
+                            "sentence" -> {
+                                val sentence = json.optString("sentence").trim()
+                                if (sentence.isNotEmpty()) {
+                                    receivedOutput = true
+                                    onEvent(AssistantEvent.SpeakSentence(sentence, json.optBoolean("isFirst"), json.optLong("latencyMs")))
                                 }
                             }
-                            receivedCompleted = true
-                            onEvent(
-                                AssistantEvent.Completed(
-                                    AssistantResult(
-                                        text = text,
-                                        sampleLabel = sampleLabel,
-                                        followUps = followUps,
-                                    )
-                                )
-                            )
+                            "error" -> throw errorForCode(json.optString("code", "task_failed"), json.optString("message"), config)
+                            "completed" -> {
+                                val text = json.optString("text").trim()
+                                if (text.isEmpty() || json.optBoolean("isSample", false) ||
+                                    json.optString("taskState") != "reply_received"
+                                ) {
+                                    throw GatewayException("invalid_result", "电脑桥接未返回有效的 WorkBuddy 回复，未确认执行结果。")
+                                }
+                                receivedCompleted = true
+                                // 收到 assistant 回复仅确认响应结束，具体任务结果以回复中的事实为准。
+                                onEvent(AssistantEvent.Completed(AssistantResult(
+                                    text = text,
+                                    sampleLabel = "WorkBuddy 官方回复",
+                                    followUps = followUps(json.optJSONArray("followUps")),
+                                    isSample = false,
+                                    source = AssistantSource.PC_GATEWAY,
+                                )))
+                                break
+                            }
                         }
                     }
                 }
             }
-            receivedCompleted
-        } catch (_: Throwable) {
-            false
-        } finally {
-            conn?.disconnect()
+            if (!receivedCompleted) {
+                throw GatewayException("stream_interrupted", "电脑连接已中断，未收到 WorkBuddy 最终回复。任务可能仍在电脑端运行，请先查看电脑端状态。")
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: GatewayException) {
+            throw failure
+        } catch (failure: Exception) {
+            currentCoroutineContext().ensureActive()
+            if (receivedOutput) {
+                throw GatewayException("stream_interrupted", "电脑连接已中断，未收到 WorkBuddy 最终回复。任务可能仍在电脑端运行，请先查看电脑端状态。", failure)
+            }
+            if (requestMayHaveReachedBridge) {
+                throw GatewayException("SUBMISSION_UNKNOWN", "指令已经开始发送，但未确认电脑端是否收到。请先在电脑端确认状态，不要重复提交。", failure)
+            }
+            throw networkFailure(failure)
         }
+    }
+
+    private suspend fun <T> withConnection(
+        config: GatewayConnectionConfig,
+        path: String,
+        authenticated: Boolean,
+        block: suspend (HttpURLConnection) -> T,
+    ): T = coroutineScope {
+        currentCoroutineContext().ensureActive()
+        val connection = (URL(config.endpoint + path).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 3_000
+            readTimeout = 5_000
+            useCaches = false
+            instanceFollowRedirects = false
+            if (authenticated) setRequestProperty("Authorization", "Bearer ${config.pairingToken}")
+        }
+        val closer = launch(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                connection.disconnect()
+            }
+        }
+        try {
+            block(connection)
+        } finally {
+            closer.cancel()
+            connection.disconnect()
+        }
+    }
+
+    private fun requireSuccessfulHttp(connection: HttpURLConnection, config: GatewayConnectionConfig) {
+        val status = connection.responseCode
+        if (status == 200) return
+        if (status in 300..399) {
+            throw GatewayException("redirect_rejected", "电脑桥接地址发生了重定向，请填写最终桥接地址后重试。")
+        }
+        if (status == 404) throw GatewayException("protocol_mismatch", "该地址没有 WorkBuddy 桥接接口，请检查桥接地址（默认端口 3099）。")
+        val error = runCatching {
+            connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { JSONObject(it.readText()) }
+        }.getOrNull()
+        if (error != null && error.optString("code").isNotBlank()) {
+            throw errorForCode(error.optString("code"), error.optString("message"), config)
+        }
+        if (connection.requestMethod == "POST" && status >= 500) {
+            throw GatewayException("SUBMISSION_UNKNOWN", "指令发送后电脑桥接返回 HTTP $status，无法确认电脑端是否接收。请先查看电脑端状态，不要重复提交。")
+        }
+        if (status == 401 || status == 403) {
+            throw GatewayException("pairing_failed", "电脑桥接拒绝访问，请检查配对码和电脑端授权状态。")
+        }
+        throw GatewayException("http_error", "电脑桥接返回 HTTP $status，指令未得到确认，请检查电脑端桥接状态。")
+    }
+
+    private fun errorForCode(code: String, message: String, config: GatewayConnectionConfig): GatewayException {
+        val fallback = when (code.lowercase()) {
+            "unconfigured", "not_configured", "workbuddy_unconfigured" -> "电脑桥接尚未配置 WorkBuddy 官方应用，请先完成电脑端配置。"
+            "unauthorized", "authorization_required", "workbuddy_unauthorized", "auth_required" -> "WorkBuddy 尚未授权或授权已失效，请在电脑端完成官方应用授权。"
+            "workbuddy_not_ready" -> "电脑桥接尚未完成 WorkBuddy 官方应用配置或授权，请先处理电脑端配置。"
+            "scope_required" -> "WorkBuddy 官方应用授权权限不足，请在电脑端补充授权。"
+            "offline", "workbuddy_offline" -> "WorkBuddy 桌面助理当前离线，请打开电脑端 WorkBuddy 并连接助理。"
+            "busy", "workbuddy_busy" -> "WorkBuddy 正在处理另一项指令，请等待当前任务结束后再试。"
+            "timeout", "upstream_timeout", "reply_timeout" -> "等待 WorkBuddy 回复超时，任务可能仍在执行，请先查看电脑端状态。"
+            "submission_unknown", "needs_attention", "ambiguous_reply" -> "电脑端指令结果尚不明确，请先在电脑端确认状态，不要重复提交。"
+            "duplicate_request" -> "该请求已经提交，请先查看电脑端原任务的状态。"
+            "pairing_failed", "pairing_required" -> "配对码无效，请重新填写电脑端配对码。"
+            "origin_denied" -> "电脑桥接拒绝了请求来源，请检查电脑端桥接访问设置。"
+            "upstream_unavailable", "upstream_error" -> "WorkBuddy 官方服务暂时不可用，指令未得到确认。"
+            else -> "WorkBuddy 未确认本次指令，请查看电脑端状态后重试。"
+        }
+        val safeMessage = message.trim().replace(config.pairingToken, "[配对码已隐藏]").take(400)
+        return GatewayException(code, safeMessage.ifBlank { fallback })
+    }
+
+    private fun networkFailure(failure: Exception): GatewayException = if (failure is SocketTimeoutException) {
+        GatewayException("connection_timeout", "连接电脑桥接超时，请检查地址、网络和电脑端桥接是否运行。", failure)
+    } else {
+        GatewayException("connection_failed", "无法连接电脑桥接，请检查手机与电脑的网络、桥接地址和端口。", failure)
+    }
+
+    private fun followUps(array: JSONArray?): List<String> = buildList {
+        if (array != null) for (index in 0 until array.length()) {
+            array.optString(index).trim().takeIf { it.isNotEmpty() }?.let { add(it) }
+        }
+    }
+
+    companion object {
+        const val PROTOCOL = "evax-workbuddy-v1"
     }
 }

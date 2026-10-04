@@ -16,6 +16,9 @@ class DemoAssistantEngineTest {
 
         assertEquals("下午 3 点有客户需求讨论，5 点有项目复盘。", result.text)
         assertEquals("演示数据", result.sampleLabel)
+        assertTrue(result.isSample)
+        assertEquals(AssistantSource.LOCAL_DEMO, result.source)
+        assertEquals(AssistantSource.LOCAL_DEMO, (events.first() as AssistantEvent.SourceChanged).source)
     }
 
     @Test

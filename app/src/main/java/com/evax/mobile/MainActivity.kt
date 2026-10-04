@@ -3,6 +3,7 @@ package com.evax.mobile
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -21,62 +22,115 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.evax.mobile.domain.AssistantEngine
 import com.evax.mobile.domain.DemoAssistantEngine
 import com.evax.mobile.domain.GatewayAssistantEngine
+import com.evax.mobile.domain.GatewayConnectionConfig
+import com.evax.mobile.domain.GatewayConnectionState
+import com.evax.mobile.domain.GatewayConnectionStatus
+import com.evax.mobile.domain.GatewayException
 import com.evax.mobile.domain.SpeechInputFailure
+import com.evax.mobile.platform.gateway.GatewayConfigStore
 import com.evax.mobile.platform.vision.CameraFaceTracker
 import com.evax.mobile.platform.voice.AndroidSpeechInputController
 import com.evax.mobile.platform.voice.AndroidTextToSpeechController
-import com.evax.mobile.platform.voice.RealAudioMicMonitor
 import com.evax.mobile.presentation.ConversationViewModel
 import com.evax.mobile.presentation.MessageRole
+import com.evax.mobile.ui.EvaCompanionMode
 import com.evax.mobile.ui.ConversationScreen
 import com.evax.mobile.ui.theme.EvaXTheme
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private val gatewayConfigStore by lazy { GatewayConfigStore(applicationContext) }
+    private val gatewayEngine by lazy { GatewayAssistantEngine(configProvider = gatewayConfigStore::load) }
+    private var gatewayConfig by mutableStateOf(GatewayConnectionConfig())
+    private var gatewayStatus by mutableStateOf(GatewayConnectionStatus())
+    private var gatewayOperationJob: Job? = null
+    private var gatewayOperationGeneration = 0L
+
     private val conversationViewModel: ConversationViewModel by viewModels {
-        val activeEngine: AssistantEngine = if (isRunningInstrumentationTest()) {
+        val activeEngine: AssistantEngine = if (isRunningInstrumentationTest() || isDebugDemoRequested()) {
             DemoAssistantEngine()
         } else {
-            GatewayAssistantEngine(fallbackEngine = DemoAssistantEngine())
+            gatewayEngine
         }
         ConversationViewModelFactory(
             engine = activeEngine,
-            onSpeakChunk = { sentence, isFirst ->
-                if (::speechOutputController.isInitialized) {
-                    speechOutputController.speakChunk(sentence, flush = isFirst)
-                }
-            },
+            onSpeakChunk = ::speakAssistantSentence,
         )
     }
 
     private lateinit var speechInputController: AndroidSpeechInputController
     private lateinit var speechOutputController: AndroidTextToSpeechController
     private lateinit var cameraFaceTracker: CameraFaceTracker
-    private val realAudioMicMonitor = RealAudioMicMonitor()
+    private var cameraTrackingEnabled = false
+    private var companionMode = EvaCompanionMode.COMPANION
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        cameraTrackingEnabled = savedInstanceState?.getBoolean("cameraTrackingEnabled") ?: false
+        companionMode = savedInstanceState?.getString("companionMode")
+            ?.let { value -> EvaCompanionMode.entries.firstOrNull { it.name == value } }
+            ?: EvaCompanionMode.COMPANION
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        if (companionMode != EvaCompanionMode.REST) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         speechInputController = AndroidSpeechInputController(applicationContext)
         speechOutputController = AndroidTextToSpeechController(applicationContext)
         cameraFaceTracker = CameraFaceTracker(applicationContext)
+        conversationViewModel.setSpeechCallback(::speakAssistantSentence)
+        try {
+            var loaded = gatewayConfigStore.load()
+            if (!loaded.isConfigured && !isRunningInstrumentationTest()) {
+                val isEmulator = android.os.Build.FINGERPRINT.contains("generic") ||
+                    android.os.Build.MODEL.contains("sdk", ignoreCase = true) ||
+                    android.os.Build.HARDWARE.contains("ranchu", ignoreCase = true)
+                loaded = GatewayConnectionConfig(
+                    endpoint = if (isEmulator) "http://10.0.2.2:3099" else "http://192.168.2.4:3099",
+                    pairingToken = "YvpyZ4nG0d_AlDqMP4MjWW_oDi7kfMrPF3O2x-PgTnk",
+                )
+                runCatching { gatewayConfigStore.save(loaded) }
+            }
+            gatewayConfig = loaded
+            gatewayStatus = GatewayConnectionStatus.notChecked(gatewayConfig)
+            if (gatewayConfig.isConfigured && !isRunningInstrumentationTest()) {
+                testGatewayConnection(gatewayConfig)
+            }
+        } catch (failure: GatewayException) {
+            gatewayStatus = GatewayConnectionStatus(
+                state = GatewayConnectionState.ERROR,
+                message = failure.userMessage,
+                errorCode = failure.code,
+            )
+        }
 
         setContent {
             EvaXTheme {
                 val uiState by conversationViewModel.uiState.collectAsStateWithLifecycle()
                 val faceTrackingState by cameraFaceTracker.state.collectAsStateWithLifecycle()
                 var permissionWasDenied by rememberSaveable { mutableStateOf(false) }
-                var cameraPromptedOnLaunch by rememberSaveable { mutableStateOf(false) }
                 var showLiveVoiceSheet by rememberSaveable { mutableStateOf(false) }
-                var liveMicLevel by rememberSaveable { mutableFloatStateOf(0.15f) }
+                var liveMicLevel by rememberSaveable { mutableFloatStateOf(0f) }
 
                 val systemSpeechLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult(),
@@ -105,8 +159,8 @@ class MainActivity : ComponentActivity() {
                             systemSpeechLauncher = systemSpeechLauncher,
                             onUpdateMicLevel = { liveMicLevel = it },
                             onOpenLiveSheetFallback = {
+                                liveMicLevel = 0f
                                 showLiveVoiceSheet = true
-                                realAudioMicMonitor.start { level -> liveMicLevel = level }
                             },
                         )
                     } else {
@@ -119,20 +173,13 @@ class MainActivity : ComponentActivity() {
                     contract = ActivityResultContracts.RequestPermission(),
                 ) { isGranted ->
                     cameraFaceTracker.onPermissionChanged(isGranted)
-                    if (isGranted) {
-                        cameraFaceTracker.start()
-                    }
+                    cameraTrackingEnabled = isGranted
+                    if (isGranted && companionMode != EvaCompanionMode.REST) cameraFaceTracker.start()
                 }
 
                 LaunchedEffect(Unit) {
                     val hasCam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
                     cameraFaceTracker.onPermissionChanged(hasCam)
-                    if (hasCam) {
-                        cameraFaceTracker.start()
-                    } else if (!cameraPromptedOnLaunch && !isRunningInstrumentationTest()) {
-                        cameraPromptedOnLaunch = true
-                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-                    }
                 }
 
                 LaunchedEffect(speechOutputController, lifecycle) {
@@ -143,8 +190,16 @@ class MainActivity : ComponentActivity() {
 
                 ConversationScreen(
                     state = uiState,
+                    gatewayConfig = gatewayConfig,
+                    gatewayStatus = gatewayStatus,
+                    onSaveGatewayConfig = ::saveGatewayConfig,
+                    onTestGatewayConnection = ::testGatewayConnection,
                     onDraftChanged = conversationViewModel::onDraftChanged,
-                    onSubmit = { prompt -> conversationViewModel.submitPrompt(prompt) },
+                    onSubmit = { prompt ->
+                        speechInputController.cancel()
+                        liveMicLevel = 0f
+                        conversationViewModel.submitPrompt(prompt)
+                    },
                     onMicTap = {
                         when {
                             checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED ->
@@ -152,8 +207,8 @@ class MainActivity : ComponentActivity() {
                                     systemSpeechLauncher = systemSpeechLauncher,
                                     onUpdateMicLevel = { liveMicLevel = it },
                                     onOpenLiveSheetFallback = {
+                                        liveMicLevel = 0f
                                         showLiveVoiceSheet = true
-                                        realAudioMicMonitor.start { level -> liveMicLevel = level }
                                     },
                                 )
 
@@ -175,11 +230,15 @@ class MainActivity : ComponentActivity() {
                             checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ->
                                 cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
 
-                            faceTrackingState.isCameraActive ->
+                            cameraTrackingEnabled -> {
+                                cameraTrackingEnabled = false
                                 cameraFaceTracker.stop()
+                            }
 
-                            else ->
+                            else -> {
+                                cameraTrackingEnabled = true
                                 cameraFaceTracker.start()
+                            }
                         }
                     },
                     onToggleOrientation = {
@@ -195,8 +254,40 @@ class MainActivity : ComponentActivity() {
                     liveMicLevel = liveMicLevel,
                     onDismissLiveVoiceSheet = {
                         showLiveVoiceSheet = false
-                        realAudioMicMonitor.stop()
+                        liveMicLevel = 0f
                         conversationViewModel.onListeningCancelled()
+                    },
+                    onCancelTask = {
+                        conversationViewModel.cancelProcessing()
+                        speechOutputController.stop()
+                    },
+                    onStopListening = {
+                        speechInputController.cancel()
+                        showLiveVoiceSheet = false
+                        liveMicLevel = 0f
+                        conversationViewModel.onListeningCancelled()
+                    },
+                    onClearNotice = conversationViewModel::clearNotice,
+                    onCompanionModeChanged = { mode ->
+                        val previousMode = companionMode
+                        companionMode = mode
+                        if (mode != EvaCompanionMode.COMPANION) speechOutputController.stop()
+                        if (mode == EvaCompanionMode.REST) {
+                            speechInputController.cancel()
+                            conversationViewModel.onListeningCancelled()
+                            if (uiState.isProcessing) conversationViewModel.cancelProcessing()
+                            liveMicLevel = 0f
+                            showLiveVoiceSheet = false
+                            cameraFaceTracker.stop()
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        } else {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            if (previousMode == EvaCompanionMode.REST && cameraTrackingEnabled &&
+                                checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                cameraFaceTracker.start()
+                            }
+                        }
                     },
                 )
             }
@@ -205,7 +296,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        if (::cameraFaceTracker.isInitialized &&
+        if (::cameraFaceTracker.isInitialized && cameraTrackingEnabled && companionMode != EvaCompanionMode.REST &&
             checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         ) {
             cameraFaceTracker.start()
@@ -213,7 +304,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        realAudioMicMonitor.stop()
         if (::speechInputController.isInitialized) {
             speechInputController.cancel()
             conversationViewModel.onListeningCancelled()
@@ -223,8 +313,14 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("cameraTrackingEnabled", cameraTrackingEnabled)
+        outState.putString("companionMode", companionMode.name)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
-        realAudioMicMonitor.stop()
+        conversationViewModel.setSpeechCallback(null)
         if (::speechInputController.isInitialized) speechInputController.destroy()
         if (::speechOutputController.isInitialized) speechOutputController.shutdown()
         if (::cameraFaceTracker.isInitialized) cameraFaceTracker.stop()
@@ -239,21 +335,24 @@ class MainActivity : ComponentActivity() {
         if (::speechOutputController.isInitialized) {
             speechOutputController.stop()
         }
+        onUpdateMicLevel(0f)
         conversationViewModel.onListeningStarted()
         speechInputController.start(
-            onResult = conversationViewModel::onSpeechResult,
+            onResult = { text -> onUpdateMicLevel(0f); conversationViewModel.onSpeechResult(text) },
             onPartialResult = { partial ->
                 if (partial.isNotBlank()) {
                     conversationViewModel.onDraftChanged(partial)
                 }
             },
             onRmsChanged = { rmsdB ->
-                val normalized = ((rmsdB + 2f) / 12f).coerceIn(0.05f, 1.0f)
+                val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
                 onUpdateMicLevel(normalized)
             },
             onFailure = { failure ->
+                onUpdateMicLevel(0f)
                 if (failure == SpeechInputFailure.SERVICE_UNAVAILABLE || failure == SpeechInputFailure.UNKNOWN) {
                     if (!tryLaunchSystemSpeechDialog(systemSpeechLauncher)) {
+                        conversationViewModel.onListeningCancelled()
                         onOpenLiveSheetFallback()
                     }
                 } else {
@@ -284,6 +383,58 @@ class MainActivity : ComponentActivity() {
             false
         }
     }
+
+    private fun speakAssistantSentence(sentence: String, isFirst: Boolean) {
+        if (::speechOutputController.isInitialized && companionMode == EvaCompanionMode.COMPANION &&
+            lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        ) {
+            speechOutputController.speakChunk(sentence, flush = isFirst)
+        }
+    }
+
+    private fun saveGatewayConfig(config: GatewayConnectionConfig) {
+        if (conversationViewModel.uiState.value.isProcessing || gatewayStatus.isTesting) return
+        val operation = ++gatewayOperationGeneration
+        gatewayOperationJob?.cancel()
+        gatewayStatus = GatewayConnectionStatus(state = GatewayConnectionState.CHECKING, message = "正在安全保存连接配置…")
+        gatewayOperationJob = lifecycleScope.launch {
+            try {
+                val saved = withContext(Dispatchers.IO) {
+                    config.validated().also(gatewayConfigStore::save)
+                }
+                if (operation == gatewayOperationGeneration) {
+                    gatewayConfig = saved
+                    gatewayStatus = GatewayConnectionStatus.notChecked(saved)
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (failure: GatewayException) {
+                if (operation == gatewayOperationGeneration) {
+                    gatewayStatus = GatewayConnectionStatus(
+                        state = GatewayConnectionState.ERROR,
+                        message = failure.userMessage,
+                        errorCode = failure.code,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun testGatewayConnection(config: GatewayConnectionConfig) {
+        if (conversationViewModel.uiState.value.isProcessing || gatewayStatus.isTesting) return
+        val operation = ++gatewayOperationGeneration
+        gatewayOperationJob?.cancel()
+        gatewayStatus = GatewayConnectionStatus(state = GatewayConnectionState.CHECKING, message = "正在检查桥接、授权与助理在线状态…")
+        gatewayOperationJob = lifecycleScope.launch {
+            val checked = gatewayEngine.testConnection(config)
+            if (operation == gatewayOperationGeneration) gatewayStatus = checked
+        }
+    }
+
+    // Local QA may opt into deterministic demo content in debug builds only.
+    private fun isDebugDemoRequested(): Boolean =
+        applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 &&
+            intent.getBooleanExtra("demo_mode", false)
 
     private fun isRunningInstrumentationTest(): Boolean {
         return try {

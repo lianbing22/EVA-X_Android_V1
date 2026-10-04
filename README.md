@@ -1,48 +1,64 @@
-# EVA-X Android V1
+# EVA-X Android — WorkBuddy Companion 1.2
 
-EVA-X V1 is a native Android demonstration app built with Kotlin and Jetpack Compose. It presents a voice-and-text desk companion interaction with a local, deterministic demo engine.
+Native Android desk companion built with Kotlin and Jetpack Compose.
 
-## What works in the demo
+## Current interface
 
-- Chinese text prompts and two guided office scenarios.
-- Animated assistant face with listening, thinking, execution, completion, and error states.
-- Meeting-summary progress steps and sample follow-up items.
-- Android speech recognition after a first-use disclosure and microphone permission grant.
-- Android TextToSpeech playback with a stop control.
-- All answers and progress are sample content. No WorkBuddy, OpenAI, Qwen, Gateway, MCP, or other remote provider is connected.
+- Pure black immersive home with large, minimal teal eyes; no iris or face frame.
+- Random idle gaze and blinking, tap-to-look, double-tap wink, and separate listening, thinking, execution, completion and error expressions.
+- Voice and tools are the main home controls. Swipe upward to open conversation details; shortcuts and settings live in drawers.
+- A compact current-task card shows reported progress. Replies appear briefly as subtitles and remain in conversation details.
+- Companion mode allows automatic speech. Do Not Disturb pauses idle gestures and automatic speech while allowing deliberate interaction. Rest stops speech recognition, playback, camera tracking and keep-screen-on; tap to wake.
+- Camera tracking is opt-in from settings. Audio levels come from the recognition service instead of a synthetic waveform. Reduced motion is available in settings.
 
-The demo schedule is fixed: “下午 3 点有客户需求讨论，5 点有项目复盘。” Conversation data stays in memory for the current app process. The app does not request camera, location, contacts, Bluetooth, or notification permissions, and its manifest does not request internet access.
+## Computer connection and demo data
 
-## Open and run
+The settings drawer now has a computer connection panel with a configurable bridge URL, masked pairing code, save and connection test. Pairing settings are encrypted with Android Keystore. Testing unsaved input does not save it; changed input invalidates the earlier validation.
 
-1. Install Android Studio with JDK 17, Android SDK Platform 37, and Android Build Tools 37. `compileSdk` is 37 because the pinned Compose dependencies require it; the app still targets API 36.
-2. Install Gradle 9.4.1 locally, then run `gradle wrapper --gradle-version 9.4.1` from the project root to create the standard wrapper files.
-3. Open this project folder in Android Studio and allow Gradle sync.
-4. Run the `app` configuration on an Android 8.0 (API 26) or newer device or emulator.
+`GatewayAssistantEngine` only accepts the paired `evax-workbuddy-v1` bridge and verifies the official local assistant's authorization and online state before sending a command. The matching computer service is in `../evax-workbuddy-bridge`; its README explains WorkBuddy app registration, OAuth, USB/LAN setup and real task acceptance. Default port is 3099. The old 3088 service was model chat/DSH bookkeeping and is not used.
 
-The project is pinned to Gradle 9.4.1, Android Gradle Plugin 9.2.0, Kotlin 2.2.10, and Compose BOM 2026.09.00. AGP 9 provides built-in Kotlin support; the Compose compiler plugin stays pinned to Kotlin 2.2.10. This source handoff contains the wrapper version properties but not `gradle-wrapper.jar` or launcher scripts because Gradle was not installed in the implementation environment. After the one-time wrapper generation above, use `./gradlew` (Windows: `gradlew.bat`).
+Normal operation never falls back to demo data. Missing configuration, pairing failures, missing OAuth, offline desktop assistant and failed streams produce actionable errors. The existing debug intent and instrumentation still explicitly select isolated local demo engines for UI QA.
 
-Useful commands after wrapper generation:
+The public local-assistant API returns messages without a reliable task-end or remote-cancellation signal. A returned reply is labeled as a WorkBuddy reply, not independently verified task completion. The bridge keeps that request unresolved until the computer user checks and acknowledges it. “停止接收” closes the phone connection; an already submitted computer task may continue. Ambiguous submission failures offer a computer-state check rather than one-tap retry.
+
+Calendar, meeting material and screenshot capabilities depend on actual WorkBuddy connectors, files, skills and permissions. Shortcuts submit instructions; they do not imply that those capabilities are already configured.
+
+Conversation history is in memory. Process termination clears it; orientation changes preserve the current interface state.
+
+## Build and run
+
+Requires JDK 17, Gradle 9.4.1, Android SDK Platform 37 and corresponding Build Tools. Minimum device API is 26; target API is 36. The project pins AGP 9.2.0, Kotlin 2.2.10 and Compose BOM 2026.09.00. AGP 9 supplies built-in Kotlin support.
+
+This source contains wrapper version properties but no wrapper launcher or JAR. Use an existing Gradle 9.4.1 installation:
 
 ```sh
-./gradlew :app:testDebugUnitTest
-./gradlew :app:connectedDebugAndroidTest
-./gradlew :app:assembleDebug
+gradle :app:assembleDebug
+gradle :app:testDebugUnitTest
+gradle :app:connectedDebugAndroidTest
 ```
 
-The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk` after a successful `assembleDebug` build.
+The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
-## Voice and privacy
+For isolated local UI QA, a debug build can explicitly use the demo engine:
 
-The app explains before recording that the installed Android speech service handles recognition and may process or transmit audio according to that service’s behavior. EVA-X V1 does not upload audio to an EVA-X server. Microphone permission is requested only after the user taps “语音输入” and accepts the disclosure. If permission is denied or speech recognition is unavailable, text entry remains available.
+```sh
+adb shell am start -n com.evax.mobile/.MainActivity --ez demo_mode true
+```
 
-Text-to-speech uses the device’s Android TTS service and requests the `zh-CN` voice. Voice availability depends on installed Android services and language data.
+The intent option is ignored by non-debug builds. Instrumentation tests also use local demo or loopback fake servers, and do not trigger computer actions.
 
-## Project structure
+## Voice and camera
 
-- `domain/`: demo engine, event stream, result models, and speech failure types.
-- `presentation/`: in-memory conversation state and state machine.
-- `ui/`: Compose screen, animated avatar, and EVA-X theme.
-- `platform/voice/`: Android speech recognition and TextToSpeech adapters.
+The installed Android speech service handles recognition and may process or transmit audio. Microphone permission is requested after the user taps voice input and accepts the disclosure. Recognized text is sent to the active assistant gateway when one is available. If no speech service is available, the interface offers text entry and stops showing a recording state.
 
-The `AssistantEngine` interface is the replacement seam for a future EVA Gateway integration. No remote provider adapter or credentials are included in this version.
+Text-to-speech uses the installed Android TTS service and requests a Chinese voice. Actual speech recognition, language data, playback and face tracking depend on the device and require physical-device verification.
+
+The manifest includes internet, microphone and camera permissions; camera permission is only requested when the user enables face tracking.
+
+## Structure
+
+- `domain/`: gateway/demo engines, event stream and result/source models.
+- `presentation/`: conversation state, real progress, cancellation and completion timing.
+- `ui/`: companion home, drawers, animated Canvas eyes and theme.
+- `platform/voice/`: Android speech recognition and playback adapters.
+- `platform/vision/`: camera tracking adapter.

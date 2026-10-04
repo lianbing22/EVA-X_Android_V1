@@ -1,93 +1,58 @@
 package com.evax.mobile.ui
 
-import android.content.res.Configuration
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.DialogWindowProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.evax.mobile.domain.AssistantSource
+import com.evax.mobile.domain.GatewayConnectionConfig
+import com.evax.mobile.domain.GatewayConnectionState
+import com.evax.mobile.domain.GatewayConnectionStatus
 import com.evax.mobile.platform.vision.FaceTrackingState
-import com.evax.mobile.presentation.AssistantPhase
-import com.evax.mobile.presentation.ConversationMessage
-import com.evax.mobile.presentation.ConversationUiState
-import com.evax.mobile.presentation.MessageRole
+import com.evax.mobile.presentation.*
+import kotlinx.coroutines.delay
 
-private val HudGlassBg = Color(0xFF0B0E17)
-private val HudTileBg = Color(0xFF141926)
-private val EvaMint = Color(0xFF4AF5A8)
-private val HudCyan = Color(0xFF00F5D4)
-private val HudViolet = Color(0xFFB9A9FF)
+private val CompanionAccent = androidx.compose.ui.graphics.Color(0xFF45E5CC)
+private val CompanionMuted = androidx.compose.ui.graphics.Color(0xFF9AA9B5)
+private val CompanionSurface = androidx.compose.ui.graphics.Color(0xEE10151A)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -105,165 +70,259 @@ fun ConversationScreen(
     showLiveVoiceSheet: Boolean = false,
     liveMicLevel: Float = 0f,
     onDismissLiveVoiceSheet: () -> Unit = {},
+    onCancelTask: () -> Unit = {},
+    onStopListening: () -> Unit = {},
+    onClearNotice: () -> Unit = {},
+    onCompanionModeChanged: (EvaCompanionMode) -> Unit = {},
+    gatewayConfig: GatewayConnectionConfig = GatewayConnectionConfig(),
+    gatewayStatus: GatewayConnectionStatus = GatewayConnectionStatus(),
+    onSaveGatewayConfig: (GatewayConnectionConfig) -> Unit = {},
+    onTestGatewayConnection: (GatewayConnectionConfig) -> Unit = {},
 ) {
-    val configuration = LocalConfiguration.current
-    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-
-    val latestAssistant = state.messages.lastOrNull { it.role == MessageRole.ASSISTANT }
-    val conversationListState = rememberLazyListState()
-    var noticeDismissed by remember(state.notice) { mutableStateOf(false) }
-    var showVoiceDisclosure by rememberSaveable { mutableStateOf(false) }
+    var panel by rememberSaveable { mutableStateOf<String?>(null) }
+    var modeOrdinal by rememberSaveable { mutableIntStateOf(EvaCompanionMode.COMPANION.ordinal) }
+    var reduceMotion by rememberSaveable { mutableStateOf(false) }
     var voiceDisclosureAccepted by rememberSaveable { mutableStateOf(false) }
-
-    var pureEyesMode by rememberSaveable { mutableStateOf(false) }
-    var eyeStyleOrdinal by rememberSaveable { mutableStateOf(EvaEyeStyle.EVA_MINT.ordinal) }
-    var companionModeOrdinal by rememberSaveable { mutableStateOf(EvaCompanionMode.COMPANION.ordinal) }
-
-    val currentEyeStyle = EvaEyeStyle.entries[eyeStyleOrdinal % EvaEyeStyle.entries.size]
-    val currentCompanionMode = EvaCompanionMode.entries[companionModeOrdinal % EvaCompanionMode.entries.size]
-
-    val activeFaceOffset = if (faceTrackingState.isCameraActive && faceTrackingState.faceDetected) {
-        Offset(faceTrackingState.faceX, faceTrackingState.faceY)
-    } else {
-        null
-    }
-
-    val hudGradientBorder = remember {
-        Brush.linearGradient(
-            colors = listOf(
-                EvaMint.copy(alpha = 0.65f),
-                HudCyan.copy(alpha = 0.50f),
-                HudViolet.copy(alpha = 0.45f),
-            ),
+    var showVoiceDisclosure by remember { mutableStateOf(false) }
+    var showSubtitle by remember { mutableStateOf(false) }
+    var gatewayEditedAfterCheck by remember(gatewayConfig) { mutableStateOf(false) }
+    var lastTestedGatewayConfig by remember(gatewayConfig) { mutableStateOf<GatewayConnectionConfig?>(null) }
+    val savedGatewayStatus = if (!gatewayStatus.isTesting && (gatewayEditedAfterCheck ||
+            lastTestedGatewayConfig?.let { it != gatewayConfig } == true)) {
+        GatewayConnectionStatus(
+            state = if (gatewayConfig.endpoint.isNotBlank() && gatewayConfig.pairingToken.isNotBlank()) GatewayConnectionState.NOT_CHECKED else GatewayConnectionState.UNCONFIGURED,
+            message = "当前保存的连接尚未验证",
+            configured = gatewayConfig.endpoint.isNotBlank() && gatewayConfig.pairingToken.isNotBlank(),
         )
+    } else gatewayStatus
+    val testGateway = { config: GatewayConnectionConfig ->
+        gatewayEditedAfterCheck = false
+        lastTestedGatewayConfig = config
+        onTestGatewayConnection(config)
     }
+    val mode = EvaCompanionMode.entries[modeOrdinal]
+    val latest = state.messages.lastOrNull { it.role == MessageRole.ASSISTANT }
+    val latestUser = state.messages.lastOrNull { it.role == MessageRole.USER }
+    val faceOffset = if (faceTrackingState.isCameraActive && faceTrackingState.faceDetected) {
+        Offset(faceTrackingState.faceX, faceTrackingState.faceY)
+    } else null
 
-    val edgeTransition = rememberInfiniteTransition(label = "edge-aura")
-    val edgePulse by edgeTransition.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1_100, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "edgePulse",
-    )
-
-    val edgeGlowActive = state.phase == AssistantPhase.LISTENING ||
-        state.phase == AssistantPhase.THINKING ||
-        state.phase == AssistantPhase.EXECUTING ||
-        faceTrackingState.faceDetected
-
-    val edgeColor = when {
-        state.phase == AssistantPhase.LISTENING -> EvaMint
-        state.phase == AssistantPhase.THINKING || state.phase == AssistantPhase.EXECUTING -> HudViolet
-        faceTrackingState.faceDetected -> EvaMint.copy(alpha = 0.55f)
-        else -> Color.Transparent
-    }
-
-    LaunchedEffect(state.messages.size, state.streamingReply) {
-        val totalCount = conversationListState.layoutInfo.totalItemsCount
-        if (totalCount > 0) {
-            runCatching { conversationListState.animateScrollToItem(totalCount - 1) }
+    LaunchedEffect(mode) { onCompanionModeChanged(mode) }
+    LaunchedEffect(latest?.id, state.voicePlayback.isSpeaking, state.phase) {
+        showSubtitle = latest != null
+        if (!state.voicePlayback.isSpeaking && !state.isProcessing) {
+            delay(6_000)
+            showSubtitle = false
         }
     }
 
-    Scaffold(
-        containerColor = Color(0xFF030406),
-    ) { scaffoldPadding ->
+    val requestMic = {
+        if (voiceDisclosureAccepted) onMicTap() else showVoiceDisclosure = true
+    }
+    val openTools = {
+        if (mode == EvaCompanionMode.REST) modeOrdinal = EvaCompanionMode.COMPANION.ordinal
+        else panel = "tools"
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black),
+    ) {
+        val landscape = maxWidth > maxHeight
+        val compactInput = landscape && WindowInsets.ime.getBottom(LocalDensity.current) > 0
+        val sceneHeight by animateDpAsState(
+            targetValue = if (state.isProcessing || panel != null) maxHeight * 0.64f else maxHeight * 0.84f,
+            animationSpec = tween(if (reduceMotion) 0 else 280),
+            label = "companion-scene-height",
+        )
+        val panelHeight = maxHeight * if (landscape) 0.94f else 0.86f
+        var dragDistance by remember { mutableFloatStateOf(0f) }
+
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0xFF030406))
-                .drawWithContent {
-                    drawContent()
-                    if (edgeGlowActive) {
-                        val boost = if (state.phase == AssistantPhase.LISTENING) (1f + liveMicLevel * 1.2f) else 1f
-                        val strokeW = if (state.phase == AssistantPhase.LISTENING) {
-                            (6.dp.toPx() * edgePulse * boost).coerceAtMost(14.dp.toPx())
-                        } else {
-                            3.dp.toPx() * (0.5f + 0.5f * edgePulse)
+            Modifier.fillMaxSize().pointerInput(mode) {
+                detectVerticalDragGestures(
+                    onDragStart = { dragDistance = 0f },
+                    onVerticalDrag = { _, amount -> dragDistance += amount },
+                    onDragEnd = {
+                        if (dragDistance < -64.dp.toPx()) {
+                            if (mode == EvaCompanionMode.REST) modeOrdinal = EvaCompanionMode.COMPANION.ordinal
+                            else panel = "conversation"
                         }
-                        drawRoundRect(
-                            brush = Brush.linearGradient(
-                                colors = listOf(
-                                    edgeColor.copy(alpha = (0.85f * edgePulse).coerceIn(0f, 1f)),
-                                    HudCyan.copy(alpha = (0.65f * edgePulse).coerceIn(0f, 1f)),
-                                    edgeColor.copy(alpha = (0.85f * edgePulse).coerceIn(0f, 1f)),
-                                ),
-                            ),
-                            topLeft = Offset(strokeW / 2f, strokeW / 2f),
-                            size = Size(size.width - strokeW, size.height - strokeW),
-                            cornerRadius = CornerRadius(24.dp.toPx(), 24.dp.toPx()),
-                            style = Stroke(width = strokeW),
+                    },
+                )
+            },
+        ) {
+            Text(
+                text = if (mode == EvaCompanionMode.COMPANION) "EVA-X" else mode.title,
+                modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(24.dp, 16.dp),
+                color = CompanionMuted.copy(alpha = 0.6f),
+                style = MaterialTheme.typography.labelMedium,
+            )
+            if (faceTrackingState.isCameraActive && mode != EvaCompanionMode.REST) {
+                Text(
+                    "视觉已开启",
+                    Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(24.dp, 16.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = CompanionMuted,
+                )
+            }
+
+            AssistantAvatar(
+                phase = state.phase,
+                modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(sceneHeight),
+                diameter = 160.dp,
+                isSpeaking = state.voicePlayback.isSpeaking,
+                faceOffset = faceOffset,
+                eyeStyle = EvaEyeStyle.CYBER_COZMO,
+                companionMode = mode,
+                isLandscape = landscape,
+                micLevel = if (state.phase == AssistantPhase.LISTENING) liveMicLevel else 0f,
+                reduceMotion = reduceMotion,
+                onBackgroundTap = openTools,
+            )
+
+            Column(
+                Modifier.align(Alignment.BottomCenter).widthIn(max = 720.dp).fillMaxWidth().navigationBarsPadding()
+                    .padding(horizontal = if (landscape) 44.dp else 24.dp, vertical = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (mode != EvaCompanionMode.REST) {
+                    when {
+                        state.isProcessing -> TaskPeek(state, onCancelTask)
+                        state.phase == AssistantPhase.LISTENING -> {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                SymmetricAudioWaveform(AssistantPhase.LISTENING, isSpeaking = false, modifier = Modifier.width(112.dp).height(24.dp), micLevel = liveMicLevel, reduceMotion = reduceMotion)
+                                Spacer(Modifier.width(12.dp))
+                                Text("正在聆听", color = CompanionAccent)
+                                TextButton(onClick = onStopListening) { Text("停止") }
+                            }
+                        }
+                        state.notice != null -> Surface(
+                            color = CompanionSurface,
+                            shape = RoundedCornerShape(20.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(Modifier.padding(16.dp)) {
+                                Text(state.notice, style = MaterialTheme.typography.bodyMedium)
+                                if (state.phase == AssistantPhase.ERROR && !state.canRetryTask &&
+                                    !state.notice.contains("电脑端确认")) {
+                                    Text("请先在电脑端确认状态", color = CompanionMuted, style = MaterialTheme.typography.bodySmall)
+                                }
+                                Row(Modifier.horizontalScroll(rememberScrollState())) {
+                                    if (state.phase == AssistantPhase.ERROR && latestUser != null && state.canRetryTask) {
+                                        TextButton(onClick = { onSubmit(latestUser.text) }) { Text("重试") }
+                                    } else if (state.phase == AssistantPhase.ERROR && !state.canRetryTask) {
+                                        TextButton(
+                                            onClick = { panel = "connection"; testGateway(gatewayConfig) },
+                                            enabled = !gatewayStatus.isTesting,
+                                        ) { Text("查看电脑状态") }
+                                    }
+                                    TextButton(onClick = { panel = "conversation" }) { Text("文字输入") }
+                                    TextButton(onClick = { panel = "connection" }) { Text("电脑连接") }
+                                    TextButton(onClick = onClearNotice) { Text("知道了") }
+                                }
+                            }
+                        }
+                        else -> AnimatedVisibility(showSubtitle, enter = fadeIn(), exit = fadeOut()) {
+                            Column(
+                                Modifier.fillMaxWidth().clickable { panel = "conversation" }
+                                    .semantics { contentDescription = "查看回复详情" },
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                if (latest?.isSample == true) {
+                                    Text("演示数据", style = MaterialTheme.typography.labelSmall, color = CompanionMuted)
+                                }
+                                Text(
+                                    latest?.text.orEmpty(), maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                )
+                                if (state.voicePlayback.isSpeaking) {
+                                    Text("正在播报", style = MaterialTheme.typography.labelSmall, color = CompanionAccent)
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (mode == EvaCompanionMode.REST) {
+                        OutlinedButton(onClick = { modeOrdinal = EvaCompanionMode.COMPANION.ordinal }) { Text("唤醒") }
+                    } else {
+                        OutlinedButton(
+                            onClick = if (state.phase == AssistantPhase.LISTENING) onStopListening else requestMic,
+                            enabled = !state.isProcessing,
+                            border = BorderStroke(1.dp, CompanionAccent.copy(alpha = 0.38f)),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = CompanionAccent),
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text(if (state.phase == AssistantPhase.LISTENING) "停止聆听" else "语音输入") }
+                        TextButton(onClick = { panel = "tools" }, Modifier.heightIn(min = 48.dp)) { Text("工具", color = CompanionMuted) }
+                    }
+                }
+            }
+        }
+
+        if (panel != null) {
+            ModalBottomSheet(
+                onDismissRequest = { panel = null },
+                sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+                containerColor = MaterialTheme.colorScheme.surface,
+                scrimColor = androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.35f),
+            ) {
+                ImmersiveSheetWindow()
+                Column(Modifier.fillMaxWidth().heightIn(max = panelHeight).imePadding()) {
+                    if (!((panel == "conversation" || panel == "connection") && compactInput)) Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            when (panel) { "conversation" -> "对话详情"; "settings" -> "设置"; "connection" -> "电脑连接"; else -> "快捷工具" },
+                            style = MaterialTheme.typography.titleLarge,
+                        )
+                        TextButton(onClick = { panel = null }) { Text("收起") }
+                    }
+                    when (panel) {
+                        "conversation" -> ConversationDetails(state, onDraftChanged, onSubmit, onSpeakLatest, onStopSpeaking, onCancelTask, compactInput)
+                        "settings" -> SettingsPanel(
+                            state, faceTrackingState, landscape, mode, reduceMotion,
+                            onToggleCameraTracking, onToggleOrientation, onCycleSpeechRate,
+                            onModeChanged = {
+                                modeOrdinal = it.ordinal
+                                if (it == EvaCompanionMode.REST) panel = null
+                            },
+                            onReduceMotionChanged = { reduceMotion = it },
+                            gatewayStatus = savedGatewayStatus,
+                            onConnection = { panel = "connection" },
+                        )
+                        "connection" -> GatewayConnectionPanel(
+                            config = gatewayConfig,
+                            status = gatewayStatus,
+                            isProcessing = state.isProcessing,
+                            onSave = {
+                                gatewayEditedAfterCheck = true
+                                lastTestedGatewayConfig = null
+                                onSaveGatewayConfig(it)
+                            },
+                            onTest = testGateway,
+                            onBack = { panel = "settings" },
+                            hasUnverifiedEdits = gatewayEditedAfterCheck,
+                            verifiedInput = lastTestedGatewayConfig,
+                            onInputEdited = { gatewayEditedAfterCheck = true },
+                        )
+                        else -> ToolsPanel(
+                            state,
+                            onAction = { prompt -> panel = null; onSubmit(prompt) },
+                            onConversation = { panel = "conversation" },
+                            onSettings = { panel = "settings" },
+                            onConnectionCheck = { panel = "connection"; testGateway(gatewayConfig) },
+                            isTestingConnection = gatewayStatus.isTesting,
                         )
                     }
                 }
-                .imePadding()
-                .padding(scaffoldPadding),
-        ) {
-            if (isLandscape) {
-                DingTalkEvaLandscapeLayout(
-                    state = state,
-                    latestAssistant = latestAssistant,
-                    conversationListState = conversationListState,
-                    pureEyesMode = pureEyesMode,
-                    onTogglePureMode = { pureEyesMode = !pureEyesMode },
-                    eyeStyle = currentEyeStyle,
-                    onCycleEyeStyle = {
-                        eyeStyleOrdinal = (eyeStyleOrdinal + 1) % EvaEyeStyle.entries.size
-                    },
-                    companionMode = currentCompanionMode,
-                    onCycleCompanionMode = {
-                        companionModeOrdinal = (companionModeOrdinal + 1) % EvaCompanionMode.entries.size
-                    },
-                    faceTrackingState = faceTrackingState,
-                    activeFaceOffset = activeFaceOffset,
-                    onToggleCameraTracking = onToggleCameraTracking,
-                    onToggleOrientation = onToggleOrientation,
-                    onCycleSpeechRate = onCycleSpeechRate,
-                    hudGradientBorder = hudGradientBorder,
-                    noticeDismissed = noticeDismissed,
-                    onDismissNotice = { noticeDismissed = true },
-                    onDraftChanged = onDraftChanged,
-                    onSubmit = onSubmit,
-                    onMicClick = {
-                        if (voiceDisclosureAccepted) onMicTap() else showVoiceDisclosure = true
-                    },
-                    onSpeakLatest = onSpeakLatest,
-                    onStopSpeaking = onStopSpeaking,
-                )
-            } else {
-                PortraitHudLayout(
-                    state = state,
-                    latestAssistant = latestAssistant,
-                    conversationListState = conversationListState,
-                    pureEyesMode = pureEyesMode,
-                    onTogglePureMode = { pureEyesMode = !pureEyesMode },
-                    eyeStyle = currentEyeStyle,
-                    onCycleEyeStyle = {
-                        eyeStyleOrdinal = (eyeStyleOrdinal + 1) % EvaEyeStyle.entries.size
-                    },
-                    companionMode = currentCompanionMode,
-                    onCycleCompanionMode = {
-                        companionModeOrdinal = (companionModeOrdinal + 1) % EvaCompanionMode.entries.size
-                    },
-                    faceTrackingState = faceTrackingState,
-                    activeFaceOffset = activeFaceOffset,
-                    onToggleCameraTracking = onToggleCameraTracking,
-                    onToggleOrientation = onToggleOrientation,
-                    onCycleSpeechRate = onCycleSpeechRate,
-                    hudGradientBorder = hudGradientBorder,
-                    noticeDismissed = noticeDismissed,
-                    onDismissNotice = { noticeDismissed = true },
-                    onDraftChanged = onDraftChanged,
-                    onSubmit = onSubmit,
-                    onMicClick = {
-                        if (voiceDisclosureAccepted) onMicTap() else showVoiceDisclosure = true
-                    },
-                    onSpeakLatest = onSpeakLatest,
-                    onStopSpeaking = onStopSpeaking,
-                )
             }
         }
     }
@@ -271,1138 +330,249 @@ fun ConversationScreen(
     if (showVoiceDisclosure) {
         AlertDialog(
             onDismissRequest = { showVoiceDisclosure = false },
-            containerColor = Color(0xFF101522),
-            titleContentColor = Color.White,
-            textContentColor = Color(0xFFB8C4D9),
-            title = { Text("语音识别说明") },
-            text = {
-                Text(
-                    "语音识别由设备上安装的 Android 语音服务处理。该服务可能按照自己的行为对音频进行处理或传输；EVA-X 演示版不会把音频发送到 EVA-X 服务器。",
-                )
-            },
+            title = { Text("开始语音输入") },
+            text = { Text("语音由设备上的 Android 语音服务识别，可能由该服务处理或传输音频。识别后的文字会交给当前助手处理。") },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        voiceDisclosureAccepted = true
-                        showVoiceDisclosure = false
-                        onMicTap()
-                    },
-                ) { Text("继续", color = EvaMint) }
+                TextButton(onClick = { voiceDisclosureAccepted = true; showVoiceDisclosure = false; onMicTap() }) { Text("继续") }
             },
-            dismissButton = {
-                TextButton(onClick = { showVoiceDisclosure = false }) {
-                    Text("暂不", color = Color(0xFF9BA6BC))
-                }
-            },
+            dismissButton = { TextButton(onClick = { showVoiceDisclosure = false }) { Text("取消") } },
         )
     }
-
-    // Fallback Live Microphone Voice Dictation Dialog when ROM blocks background SpeechRecognizer
     if (showLiveVoiceSheet) {
         val focusRequester = remember { FocusRequester() }
-        LaunchedEffect(Unit) {
-            runCatching { focusRequester.requestFocus() }
-        }
+        LaunchedEffect(Unit) { focusRequester.requestFocus() }
         AlertDialog(
             onDismissRequest = onDismissLiveVoiceSheet,
-            containerColor = Color(0xFF0B111C),
-            titleContentColor = EvaMint,
-            textContentColor = Color(0xFFE2EBF8),
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size((10 + liveMicLevel * 10).dp)
-                            .clip(CircleShape)
-                            .background(EvaMint),
-                    )
-                    Text("正在聆听你的声音…", fontWeight = FontWeight.Bold)
-                }
-            },
+            title = { Text("改用文字输入") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        text = "麦克风已激活（声波灵敏度 ${(liveMicLevel * 100).toInt()}%）。由于当前手机系统未开放后台静默语音服务，已为你自动拉起输入法听写面板——请点击输入法键盘上的「🎤 麦克风」直接说话，或直接说出/输入任意指令：",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF9FB0C8),
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("此设备暂时没有可用的语音识别服务。你可以输入指令，也可以使用键盘自带的语音输入。")
                     OutlinedTextField(
                         value = state.draft,
                         onValueChange = onDraftChanged,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(focusRequester),
-                        placeholder = {
-                            Text("点击键盘语音麦克风说话，或直接输入…", color = Color(0xFF6E7D94))
-                        },
-                        singleLine = false,
+                        modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                        label = { Text("你的指令") },
                         maxLines = 3,
-                        shape = RoundedCornerShape(16.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = EvaMint,
-                            unfocusedBorderColor = Color(0xFF28374E),
-                            focusedContainerColor = Color(0xFF06090F),
-                            unfocusedContainerColor = Color(0xFF06090F),
-                        ),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(
-                            onSend = {
-                                if (state.draft.isNotBlank()) {
-                                    val text = state.draft
-                                    onDismissLiveVoiceSheet()
-                                    onSubmit(text)
-                                }
-                            },
-                        ),
                     )
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        LandscapeQuickChip("今天下午有什么安排", enabled = true) {
-                            onDismissLiveVoiceSheet()
-                            onSubmit("今天下午有什么安排")
-                        }
-                        LandscapeQuickChip("帮我整理刚才的会议纪要", enabled = true) {
-                            onDismissLiveVoiceSheet()
-                            onSubmit("帮我整理刚才的会议纪要")
-                        }
-                        LandscapeQuickChip("给王总发钉钉说方案写好了", enabled = true) {
-                            onDismissLiveVoiceSheet()
-                            onSubmit("给王总发钉钉说方案写好了")
-                        }
-                    }
                 }
             },
             confirmButton = {
-                Button(
-                    onClick = {
-                        val text = state.draft.trim()
-                        onDismissLiveVoiceSheet()
-                        if (text.isNotBlank()) {
-                            onSubmit(text)
-                        }
-                    },
+                TextButton(
+                    onClick = { val text = state.draft; onDismissLiveVoiceSheet(); if (text.isNotBlank()) onSubmit(text) },
                     enabled = state.draft.isNotBlank(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = EvaMint,
-                        contentColor = Color(0xFF04140C),
-                    ),
-                ) {
-                    Text("发送语音内容", fontWeight = FontWeight.Bold)
-                }
+                ) { Text("发送") }
             },
-            dismissButton = {
-                TextButton(onClick = onDismissLiveVoiceSheet) {
-                    Text("取消", color = Color(0xFF9BA6BC))
-                }
-            },
+            dismissButton = { TextButton(onClick = onDismissLiveVoiceSheet) { Text("取消") } },
         )
     }
 }
 
 @Composable
-private fun DingTalkEvaLandscapeLayout(
+private fun TaskPeek(state: ConversationUiState, onCancel: () -> Unit) {
+    Surface(
+        Modifier.fillMaxWidth(), color = CompanionSurface,
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, CompanionAccent.copy(alpha = 0.12f)),
+    ) {
+        Column(Modifier.padding(horizontal = 18.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(if (state.phase == AssistantPhase.THINKING) "正在理解" else "正在执行", style = MaterialTheme.typography.labelLarge, color = CompanionAccent)
+                TextButton(onClick = onCancel) { Text("停止接收") }
+            }
+            Text(state.currentStep ?: "正在准备，请稍候…", style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (state.progressTotal > 0) {
+                LinearProgressIndicator(
+                    progress = { (state.completedProgressSteps.size.toFloat() / state.progressTotal).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(), color = CompanionAccent,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                )
+                Text("${state.progressIndex} / ${state.progressTotal}", color = CompanionMuted, style = MaterialTheme.typography.labelSmall)
+            } else {
+                LinearProgressIndicator(Modifier.fillMaxWidth(), color = CompanionAccent, trackColor = MaterialTheme.colorScheme.surfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToolsPanel(
     state: ConversationUiState,
-    latestAssistant: ConversationMessage?,
-    conversationListState: androidx.compose.foundation.lazy.LazyListState,
-    pureEyesMode: Boolean,
-    onTogglePureMode: () -> Unit,
-    eyeStyle: EvaEyeStyle,
-    onCycleEyeStyle: () -> Unit,
-    companionMode: EvaCompanionMode,
-    onCycleCompanionMode: () -> Unit,
-    faceTrackingState: FaceTrackingState,
-    activeFaceOffset: Offset?,
-    onToggleCameraTracking: () -> Unit,
-    onToggleOrientation: () -> Unit,
-    onCycleSpeechRate: () -> Unit,
-    hudGradientBorder: Brush,
-    noticeDismissed: Boolean,
-    onDismissNotice: () -> Unit,
+    onAction: (String) -> Unit,
+    onConversation: () -> Unit,
+    onSettings: () -> Unit,
+    onConnectionCheck: () -> Unit,
+    isTestingConnection: Boolean,
+) {
+    val actions = listOf(
+        "查今天的安排" to "查今天的安排",
+        "整理会议纪要" to "整理会议纪要",
+        "截屏分析" to "分析电脑当前窗口截图",
+        "整理当前工作" to "请基于电脑上当前工作内容，梳理今天最重要的三项待办，并说明依据；缺少上下文时先询问我",
+        "起草回复" to "请为我正在处理的消息起草回复；先确认消息内容和接收方，只生成草稿，不发送",
+    )
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        SourceLabel(state)
+        actions.chunked(2).forEach { pair ->
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                pair.forEach { (label, prompt) ->
+                    OutlinedButton(
+                        onClick = { onAction(prompt) }, enabled = !state.isProcessing,
+                        modifier = Modifier.weight(1f).heightIn(min = 60.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    ) { Text(label, maxLines = 2, style = MaterialTheme.typography.labelLarge) }
+                }
+            }
+        }
+        OutlinedButton(
+            onClick = onConnectionCheck,
+            enabled = !state.isProcessing && !isTestingConnection,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp),
+        ) { Text(if (isTestingConnection) "正在检查连接…" else "检查电脑连接") }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            TextButton(onClick = onConversation) { Text("对话详情") }
+            TextButton(onClick = onSettings) { Text("设置") }
+        }
+    }
+}
+
+@Composable
+private fun SourceLabel(state: ConversationUiState) {
+    Text(
+        when (state.source) {
+            AssistantSource.PC_GATEWAY -> "WorkBuddy · 电脑任务通道"
+            AssistantSource.LOCAL_DEMO -> "本地演示 · 示例内容"
+            AssistantSource.UNCONFIRMED -> "电脑连接尚未确认"
+        },
+        style = MaterialTheme.typography.labelMedium, color = CompanionMuted,
+    )
+}
+
+@Composable
+private fun ConversationDetails(
+    state: ConversationUiState,
     onDraftChanged: (String) -> Unit,
     onSubmit: (String) -> Unit,
-    onMicClick: () -> Unit,
     onSpeakLatest: () -> Unit,
     onStopSpeaking: () -> Unit,
+    onCancel: () -> Unit,
+    compactInput: Boolean,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-    ) {
-        EvaControlHeaderBar(
-            phase = state.phase,
-            pureEyesMode = pureEyesMode,
-            onTogglePureMode = onTogglePureMode,
-            eyeStyle = eyeStyle,
-            onCycleEyeStyle = onCycleEyeStyle,
-            companionMode = companionMode,
-            onCycleCompanionMode = onCycleCompanionMode,
-            faceTrackingState = faceTrackingState,
-            onToggleCameraTracking = onToggleCameraTracking,
-            isLandscape = true,
-            onToggleOrientation = onToggleOrientation,
-            speechRate = state.voicePlayback.speechRate,
-            lastLatencyMs = state.lastLatencyMs,
-            onCycleSpeechRate = onCycleSpeechRate,
-        )
-
-        Spacer(Modifier.height(6.dp))
-
-        if (pureEyesMode) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentAlignment = Alignment.Center,
-            ) {
-                AssistantAvatar(
-                    phase = state.phase,
-                    diameter = 220.dp,
-                    isSpeaking = state.voicePlayback.isSpeaking,
-                    faceOffset = activeFaceOffset,
-                    eyeStyle = eyeStyle,
-                    companionMode = companionMode,
-                    isLandscape = true,
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                HudWaveformStatusBanner(
-                    phase = state.phase,
-                    currentStep = state.currentStep,
-                    isSpeaking = state.voicePlayback.isSpeaking,
-                    compact = true,
-                )
-
+    val keyboard = LocalSoftwareKeyboardController.current
+    val submit = { text: String -> keyboard?.hide(); onSubmit(text) }
+    val listState = rememberLazyListState()
+    val latest = state.messages.lastOrNull { it.role == MessageRole.ASSISTANT }
+    LaunchedEffect(state.messages.size, state.streamingReply, state.progressSteps.size) {
+        if (listState.layoutInfo.totalItemsCount > 0) listState.animateScrollToItem(listState.layoutInfo.totalItemsCount - 1)
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp).navigationBarsPadding()) {
+        if (!compactInput) SourceLabel(state)
+        if (!compactInput) LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f, fill = false).heightIn(min = 80.dp).fillMaxWidth(),
+            contentPadding = PaddingValues(vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            if (state.messages.isEmpty()) item { Text("有什么想一起处理的？", color = CompanionMuted, modifier = Modifier.padding(vertical = 24.dp)) }
+            items(state.messages, key = { it.id }) { message ->
                 Surface(
-                    shape = RoundedCornerShape(50),
-                    color = Color(0xFF0D141C),
-                    border = BorderStroke(1.dp, EvaMint.copy(alpha = 0.35f)),
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 12.dp),
+                    color = if (message.role == MessageRole.USER) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.background,
+                    shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth(),
                 ) {
-                    val subtitleText = when {
-                        !state.streamingReply.isNullOrBlank() ->
-                            "「${state.streamingReply}」"
-                        state.phase == AssistantPhase.LISTENING && state.draft.isNotBlank() ->
-                            "「正在听你说：${state.draft}…」"
-                        companionMode != EvaCompanionMode.COMPANION ->
-                            "「${companionMode.title}模式：${companionMode.subtitle}」"
-                        latestAssistant != null -> "「${latestAssistant.text}」"
-                        else -> "「主人，放心，一切包在我身上！」"
-                    }
-                    Text(
-                        text = subtitleText,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFFD9FBEA),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = onMicClick,
-                        enabled = !state.isProcessing,
-                        shape = RoundedCornerShape(50),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                        border = BorderStroke(1.dp, EvaMint.copy(alpha = 0.6f)),
-                    ) {
-                        Text("语音输入", color = EvaMint, style = MaterialTheme.typography.labelSmall)
-                    }
-                    OutlinedButton(
-                        onClick = onTogglePureMode,
-                        shape = RoundedCornerShape(50),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                        border = BorderStroke(1.dp, Color(0xFF304057)),
-                    ) {
-                        Text("展开工作台", color = Color(0xFFD0DCF0), style = MaterialTheme.typography.labelSmall)
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(if (message.role == MessageRole.USER) "你" else "EVA-X", style = MaterialTheme.typography.labelMedium, color = CompanionAccent)
+                        if (message.isSample) Text("演示数据", style = MaterialTheme.typography.labelSmall, color = CompanionMuted)
+                        Text(message.text, style = MaterialTheme.typography.bodyLarge)
+                        message.followUps.forEach { Text(it, style = MaterialTheme.typography.bodyMedium, color = CompanionMuted) }
                     }
                 }
             }
-        } else {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(
-                    modifier = Modifier
-                        .weight(0.44f)
-                        .fillMaxHeight(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        AssistantAvatar(
-                            phase = state.phase,
-                            diameter = 168.dp,
-                            isSpeaking = state.voicePlayback.isSpeaking,
-                            faceOffset = activeFaceOffset,
-                            eyeStyle = eyeStyle,
-                            companionMode = companionMode,
-                            isLandscape = true,
-                        )
-                    }
-
-                    HudWaveformStatusBanner(
-                        phase = state.phase,
-                        currentStep = state.currentStep,
-                        isSpeaking = state.voicePlayback.isSpeaking,
-                        compact = true,
-                    )
-
-                    Spacer(Modifier.height(6.dp))
-
-                    Text(
-                        text = if (faceTrackingState.faceDetected) {
-                            "${faceTrackingState.trackingSource} (${(faceTrackingState.faceX * 100).toInt()}%, ${(faceTrackingState.faceY * 100).toInt()}%)"
-                        } else {
-                            companionMode.subtitle
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (faceTrackingState.faceDetected) EvaMint else Color(0xFF8C9AB0),
-                        maxLines = 1,
-                    )
-
-                    Spacer(Modifier.height(6.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Button(
-                            onClick = onMicClick,
-                            enabled = !state.isProcessing,
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(50),
-                            contentPadding = PaddingValues(vertical = 8.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = EvaMint,
-                                contentColor = Color(0xFF04140C),
-                            ),
-                        ) {
-                            Text(
-                                text = "语音输入",
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                            )
-                        }
-
-                        if (state.voicePlayback.isSpeaking) {
-                            OutlinedButton(
-                                onClick = onStopSpeaking,
-                                modifier = Modifier.weight(1f),
-                                shape = RoundedCornerShape(50),
-                                contentPadding = PaddingValues(vertical = 8.dp),
-                                border = BorderStroke(1.dp, EvaMint),
-                            ) {
-                                Text("停止播报", color = EvaMint, style = MaterialTheme.typography.labelMedium)
+            if (state.progressSteps.isNotEmpty()) item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("任务步骤", style = MaterialTheme.typography.labelLarge, color = CompanionMuted)
+                    state.progressSteps.forEach { step ->
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Canvas(Modifier.size(6.dp)) {
+                                drawCircle(if (step in state.completedProgressSteps) CompanionAccent else CompanionMuted)
                             }
-                        } else {
-                            OutlinedButton(
-                                onClick = onSpeakLatest,
-                                enabled = state.voicePlayback.isReady && latestAssistant != null,
-                                modifier = Modifier.weight(1f),
-                                shape = RoundedCornerShape(50),
-                                contentPadding = PaddingValues(vertical = 8.dp),
-                                border = BorderStroke(1.dp, Color(0xFF28364A)),
-                            ) {
-                                Text("朗读回复", style = MaterialTheme.typography.labelMedium)
-                            }
-                        }
-                    }
-                }
-
-                Column(
-                    modifier = Modifier
-                        .weight(0.56f)
-                        .fillMaxHeight(),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        LandscapeQuickChip("DSH 项目工作台", enabled = !state.isProcessing) {
-                            onSubmit("查看一下电脑上的DSH项目工作台和飞书成果状态")
-                        }
-                        LandscapeQuickChip("建交付任务", enabled = !state.isProcessing) {
-                            onSubmit("帮我建个交付任务：自动检查EVA-X网关与桌面伴侣状态")
-                        }
-                        LandscapeQuickChip("查今天的安排", enabled = !state.isProcessing) {
-                            onSubmit("查今天的安排")
-                        }
-                        LandscapeQuickChip("整理会议纪要", enabled = !state.isProcessing) {
-                            onSubmit("整理会议纪要")
-                        }
-                        LandscapeQuickChip("检查电脑状态", enabled = !state.isProcessing) {
-                            onSubmit("检查电脑运行状态")
-                        }
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(Color(0xFF0E131D))
-                            .border(1.dp, hudGradientBorder, RoundedCornerShape(18.dp))
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                    ) {
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            if (state.progressSteps.isNotEmpty()) {
-                                HudProgressSection(state.progressSteps)
-                                Spacer(Modifier.height(6.dp))
-                            }
-
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1f),
-                                state = conversationListState,
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                if (state.messages.isEmpty() && state.streamingReply.isNullOrBlank()) {
-                                    item(key = "greeting") {
-                                        HudGreetingContent()
-                                    }
-                                } else {
-                                    items(state.messages, key = ConversationMessage::id) { message ->
-                                        HudMessageCard(message)
-                                    }
-                                    if (!state.streamingReply.isNullOrBlank()) {
-                                        item(key = "streaming-reply") {
-                                            HudStreamingReplyCard(
-                                                text = state.streamingReply,
-                                                latencyMs = state.lastLatencyMs,
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    state.notice?.takeIf { !noticeDismissed }?.let { notice ->
-                        NoticeBanner(notice = notice, onDismiss = onDismissNotice)
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        OutlinedTextField(
-                            value = state.draft,
-                            onValueChange = onDraftChanged,
-                            modifier = Modifier.weight(1f),
-                            placeholder = {
-                                Text(
-                                    text = "一句话交给电脑 DSH/WorkBuddy 执行或实时对话…",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF7D899E),
-                                )
-                            },
-                            singleLine = true,
-                            shape = RoundedCornerShape(18.dp),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = EvaMint.copy(alpha = 0.7f),
-                                unfocusedBorderColor = Color(0xFF202A3C),
-                                focusedContainerColor = Color(0xFF090C12),
-                                unfocusedContainerColor = Color(0xFF090C12),
-                            ),
-                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                            keyboardActions = KeyboardActions(onSend = { onSubmit(state.draft) }),
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Button(
-                            onClick = { onSubmit(state.draft) },
-                            enabled = state.draft.isNotBlank() && !state.isProcessing,
-                            shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = EvaMint,
-                                contentColor = Color(0xFF04140C),
-                            ),
-                        ) {
-                            Text("发送", fontWeight = FontWeight.Bold)
+                            Text(step)
+                            if (step == state.currentStep) Text("执行中", style = MaterialTheme.typography.labelSmall, color = CompanionAccent)
                         }
                     }
                 }
             }
+            state.streamingReply?.takeIf { it.isNotBlank() }?.let { reply -> item { Text(reply, style = MaterialTheme.typography.bodyLarge) } }
         }
-    }
-}
-
-@Composable
-private fun LandscapeQuickChip(
-    title: String,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Surface(
-        onClick = onClick,
-        enabled = enabled,
-        shape = RoundedCornerShape(50),
-        color = Color(0xFF131A28),
-        border = BorderStroke(1.dp, EvaMint.copy(alpha = 0.32f)),
-    ) {
-        Text(
-            text = title,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            style = MaterialTheme.typography.labelMedium,
-            color = if (enabled) Color(0xFFEAFBF3) else Color(0xFF6C768A),
-            fontWeight = FontWeight.Medium,
-        )
-    }
-}
-
-@Composable
-private fun PortraitHudLayout(
-    state: ConversationUiState,
-    latestAssistant: ConversationMessage?,
-    conversationListState: androidx.compose.foundation.lazy.LazyListState,
-    pureEyesMode: Boolean,
-    onTogglePureMode: () -> Unit,
-    eyeStyle: EvaEyeStyle,
-    onCycleEyeStyle: () -> Unit,
-    companionMode: EvaCompanionMode,
-    onCycleCompanionMode: () -> Unit,
-    faceTrackingState: FaceTrackingState,
-    activeFaceOffset: Offset?,
-    onToggleCameraTracking: () -> Unit,
-    onToggleOrientation: () -> Unit,
-    onCycleSpeechRate: () -> Unit,
-    hudGradientBorder: Brush,
-    noticeDismissed: Boolean,
-    onDismissNotice: () -> Unit,
-    onDraftChanged: (String) -> Unit,
-    onSubmit: (String) -> Unit,
-    onMicClick: () -> Unit,
-    onSpeakLatest: () -> Unit,
-    onStopSpeaking: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        EvaControlHeaderBar(
-            phase = state.phase,
-            pureEyesMode = pureEyesMode,
-            onTogglePureMode = onTogglePureMode,
-            eyeStyle = eyeStyle,
-            onCycleEyeStyle = onCycleEyeStyle,
-            companionMode = companionMode,
-            onCycleCompanionMode = onCycleCompanionMode,
-            faceTrackingState = faceTrackingState,
-            onToggleCameraTracking = onToggleCameraTracking,
-            isLandscape = false,
-            onToggleOrientation = onToggleOrientation,
-            speechRate = state.voicePlayback.speechRate,
-            lastLatencyMs = state.lastLatencyMs,
-            onCycleSpeechRate = onCycleSpeechRate,
-        )
-
-        Spacer(Modifier.height(6.dp))
-
-        AssistantAvatar(
-            phase = state.phase,
-            diameter = if (pureEyesMode) 260.dp else 172.dp,
-            isSpeaking = state.voicePlayback.isSpeaking,
-            faceOffset = activeFaceOffset,
-            eyeStyle = eyeStyle,
-            companionMode = companionMode,
-            isLandscape = false,
-        )
-
-        Spacer(Modifier.height(4.dp))
-
-        HudWaveformStatusBanner(
-            phase = state.phase,
-            currentStep = state.currentStep,
-            isSpeaking = state.voicePlayback.isSpeaking,
-            compact = false,
-        )
-
-        Spacer(Modifier.height(8.dp))
-
-        if (!pureEyesMode) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(HudGlassBg)
-                    .border(1.2.dp, hudGradientBorder, RoundedCornerShape(20.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-            ) {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    if (state.progressSteps.isNotEmpty()) {
-                        HudProgressSection(state.progressSteps)
-                        Spacer(Modifier.height(8.dp))
-                    }
-
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                        state = conversationListState,
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        if (state.messages.isEmpty() && state.streamingReply.isNullOrBlank()) {
-                            item(key = "greeting") {
-                                HudGreetingContent()
-                            }
-                        } else {
-                            items(state.messages, key = ConversationMessage::id) { message ->
-                                HudMessageCard(message)
-                            }
-                            if (!state.streamingReply.isNullOrBlank()) {
-                                item(key = "streaming-reply") {
-                                    HudStreamingReplyCard(
-                                        text = state.streamingReply,
-                                        latencyMs = state.lastLatencyMs,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            PcControlDeck(
-                enabled = !state.isProcessing,
-                compact = state.messages.isNotEmpty(),
-                borderBrush = hudGradientBorder,
-                onSubmit = onSubmit,
-            )
-
-            Spacer(Modifier.height(8.dp))
-        } else {
-            Spacer(Modifier.weight(1f))
+        if (state.isProcessing) TextButton(onClick = onCancel) { Text("停止接收") }
+        if (latest != null && !compactInput) {
+            TextButton(
+                onClick = if (state.voicePlayback.isSpeaking) onStopSpeaking else onSpeakLatest,
+                enabled = state.voicePlayback.isReady,
+            ) { Text(if (state.voicePlayback.isSpeaking) "停止播报" else "朗读回复") }
         }
-
-        state.notice?.takeIf { !noticeDismissed }?.let { notice ->
-            NoticeBanner(notice = notice, onDismiss = onDismissNotice)
-        }
-
-        HudBottomComposerBar(
-            draft = state.draft,
-            isProcessing = state.isProcessing,
-            isSpeaking = state.voicePlayback.isSpeaking,
-            canSpeak = state.voicePlayback.isReady && latestAssistant != null,
-            onDraftChanged = onDraftChanged,
-            onSubmit = { onSubmit(state.draft) },
-            onMicClick = onMicClick,
-            onSpeakLatest = onSpeakLatest,
-            onStopSpeaking = onStopSpeaking,
-        )
-    }
-}
-
-@Composable
-private fun EvaControlHeaderBar(
-    phase: AssistantPhase,
-    pureEyesMode: Boolean,
-    onTogglePureMode: () -> Unit,
-    eyeStyle: EvaEyeStyle,
-    onCycleEyeStyle: () -> Unit,
-    companionMode: EvaCompanionMode,
-    onCycleCompanionMode: () -> Unit,
-    faceTrackingState: FaceTrackingState,
-    onToggleCameraTracking: () -> Unit,
-    isLandscape: Boolean,
-    onToggleOrientation: () -> Unit,
-    speechRate: Float = 1.25f,
-    lastLatencyMs: Long? = null,
-    onCycleSpeechRate: () -> Unit = {},
-) {
-    val dotColor = phaseAccentColor(phase)
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Surface(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .clickable(onClick = onTogglePureMode),
-                shape = RoundedCornerShape(50),
-                color = Color(0xFF0E131F),
-                border = BorderStroke(1.dp, Color(0xFF233044)),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(dotColor),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = if (pureEyesMode) "EVA-X · 纯享大眼" else "EVA-X · 桌面伴侣",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color(0xFFE6EDF8),
-                        fontWeight = FontWeight.Medium,
-                    )
-                }
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                FaceTrackingStatusPill(
-                    faceTrackingState = faceTrackingState,
-                    onClick = onToggleCameraTracking,
-                )
-
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = Color(0xFF0E131F),
-                    border = BorderStroke(1.dp, Color(0xFF233044)),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "演示模式",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = HudViolet,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                }
-            }
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            MiniSwitchPill(
-                label = "语速: ${String.format("%.2fx", speechRate)}",
-                accent = EvaMint,
-                onClick = onCycleSpeechRate,
-            )
-            if (lastLatencyMs != null) {
-                MiniSwitchPill(
-                    label = "⚡ 首句 ${lastLatencyMs}ms",
-                    accent = HudCyan,
-                    onClick = {},
-                )
-            }
-            MiniSwitchPill(
-                label = "状态: ${companionMode.title}",
-                accent = EvaMint,
-                onClick = onCycleCompanionMode,
-            )
-            MiniSwitchPill(
-                label = "眼神: ${eyeStyle.label}",
-                accent = HudCyan,
-                onClick = onCycleEyeStyle,
-            )
-            MiniSwitchPill(
-                label = if (isLandscape) "切换竖屏" else "横屏 Eva 模式",
-                accent = HudViolet,
-                onClick = onToggleOrientation,
-            )
-            MiniSwitchPill(
-                label = if (pureEyesMode) "显示控制台" else "纯享大眼模式",
-                accent = Color(0xFF9BA6BC),
-                onClick = onTogglePureMode,
-            )
-        }
-    }
-}
-
-@Composable
-private fun FaceTrackingStatusPill(
-    faceTrackingState: FaceTrackingState,
-    onClick: () -> Unit,
-) {
-    val borderColor = when {
-        faceTrackingState.faceDetected -> EvaMint
-        faceTrackingState.isCameraActive -> HudCyan.copy(alpha = 0.6f)
-        else -> Color(0xFF34435E)
-    }
-    Surface(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(50),
-        color = Color(0xFF0E1520),
-        border = BorderStroke(1.dp, borderColor),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Canvas(modifier = Modifier.size(14.dp)) {
-                drawCircle(
-                    color = Color(0xFF1A2636),
-                    radius = size.minDimension / 2f,
-                )
-                drawCircle(
-                    color = borderColor.copy(alpha = 0.5f),
-                    radius = size.minDimension / 2f,
-                    style = Stroke(width = 1.dp.toPx()),
-                )
-                val dotX = (size.width / 2f) + (faceTrackingState.faceX * size.width * 0.35f)
-                val dotY = (size.height / 2f) + (faceTrackingState.faceY * size.height * 0.35f)
-                drawCircle(
-                    color = if (faceTrackingState.faceDetected) EvaMint else Color(0xFF7D899E),
-                    radius = if (faceTrackingState.faceDetected) 3.dp.toPx() else 2.dp.toPx(),
-                    center = Offset(dotX, dotY),
-                )
-            }
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = when {
-                    faceTrackingState.faceDetected -> "人脸跟随中"
-                    faceTrackingState.isCameraActive -> "视觉寻找人脸"
-                    else -> "开启人脸跟随"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = if (faceTrackingState.faceDetected) EvaMint else Color(0xFFD6E2F5),
-                fontWeight = FontWeight.Medium,
-            )
-        }
-    }
-}
-
-@Composable
-private fun MiniSwitchPill(
-    label: String,
-    accent: Color,
-    onClick: () -> Unit,
-) {
-    Surface(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(50),
-        color = Color(0xFF0D131E),
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.38f)),
-    ) {
-        Text(
-            text = label,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-            style = MaterialTheme.typography.labelSmall,
-            color = accent,
-            fontWeight = FontWeight.Medium,
-        )
-    }
-}
-
-@Composable
-private fun NoticeBanner(
-    notice: String,
-    onDismiss: () -> Unit,
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 6.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF2B1620)),
-        border = BorderStroke(1.dp, Color(0xFFFF7A95).copy(alpha = 0.45f)),
-        shape = RoundedCornerShape(14.dp),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 14.dp, top = 4.dp, end = 8.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = notice,
+        Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = state.draft, onValueChange = onDraftChanged,
                 modifier = Modifier.weight(1f),
-                color = Color(0xFFFFCED5),
-                style = MaterialTheme.typography.bodySmall,
+                placeholder = { Text("输入你的指令…") },
+                enabled = !state.isProcessing, maxLines = if (compactInput) 2 else 3,
+                shape = RoundedCornerShape(18.dp),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { if (state.draft.isNotBlank()) submit(state.draft) }),
             )
-            TextButton(onClick = onDismiss) {
-                Text("知道了", color = EvaMint)
-            }
+            Button(onClick = { submit(state.draft) }, enabled = state.draft.isNotBlank() && !state.isProcessing) { Text("发送") }
         }
     }
 }
 
 @Composable
-private fun HudWaveformStatusBanner(
-    phase: AssistantPhase,
-    currentStep: String?,
-    isSpeaking: Boolean,
-    compact: Boolean,
+private fun SettingsPanel(
+    state: ConversationUiState,
+    face: FaceTrackingState,
+    landscape: Boolean,
+    mode: EvaCompanionMode,
+    reduceMotion: Boolean,
+    onCamera: () -> Unit,
+    onOrientation: () -> Unit,
+    onSpeechRate: () -> Unit,
+    onModeChanged: (EvaCompanionMode) -> Unit,
+    onReduceMotionChanged: (Boolean) -> Unit,
+    gatewayStatus: GatewayConnectionStatus,
+    onConnection: () -> Unit,
 ) {
-    val accent = phaseAccentColor(phase)
-    Row(
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (!compact) {
-            SymmetricAudioWaveform(
-                phase = phase,
-                isSpeaking = isSpeaking,
-            )
-            Spacer(Modifier.width(10.dp))
-        }
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        SourceLabel(state)
         Surface(
-            shape = RoundedCornerShape(50),
-            color = Color(0xFF0E1520),
-            border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = phaseLabel(phase),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                if (currentStep != null) {
-                    Text(
-                        text = " · ",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = accent,
-                    )
-                    Text(
-                        text = currentStep,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = accent,
-                    )
-                }
-            }
-        }
-        if (!compact) {
-            Spacer(Modifier.width(10.dp))
-            SymmetricAudioWaveform(
-                phase = phase,
-                isSpeaking = isSpeaking,
-            )
-        }
-    }
-}
-
-@Composable
-private fun HudProgressSection(steps: List<String>) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFF121826))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-    ) {
-        Row(
+            onClick = onConnection,
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
         ) {
-            val totalBars = 3
-            for (i in 0 until totalBars) {
-                val active = i < steps.size
-                val barColor = when {
-                    !active -> Color(0xFF252D3D)
-                    i == 0 -> EvaMint
-                    i == 1 -> HudCyan
-                    else -> HudViolet
-                }
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(4.dp)
-                        .clip(RoundedCornerShape(50))
-                        .background(barColor),
-                )
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("电脑连接", style = MaterialTheme.typography.titleMedium, color = CompanionAccent)
+                Text(gatewayConnectionStateTitle(gatewayStatus), color = CompanionMuted, style = MaterialTheme.typography.bodySmall)
             }
         }
-        Spacer(Modifier.height(5.dp))
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            steps.forEach { step ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "✓",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = EvaMint,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        text = step,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color(0xFFD5DFEE),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
+        Text("交互", style = MaterialTheme.typography.titleMedium)
+        SettingsAction("人脸跟随", if (face.isCameraActive) "已开启" else "已关闭", onCamera)
+        SettingsAction("屏幕方向", if (landscape) "切换竖屏" else "切换横屏", onOrientation)
+        SettingsAction("播报语速", "${state.voicePlayback.speechRate}x", onSpeechRate)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("减少动态效果")
+            Switch(checked = reduceMotion, onCheckedChange = onReduceMotionChanged)
         }
-    }
-}
-
-@Composable
-private fun HudGreetingContent() {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Text("陪伴模式", style = MaterialTheme.typography.titleMedium)
+        EvaCompanionMode.entries.forEach { candidate ->
             Surface(
-                shape = RoundedCornerShape(50),
-                color = EvaMint.copy(alpha = 0.14f),
-                border = BorderStroke(1.dp, EvaMint.copy(alpha = 0.5f)),
+                modifier = Modifier.fillMaxWidth().clickable { onModeChanged(candidate) },
+                color = if (mode == candidate) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(16.dp),
             ) {
-                Text(
-                    text = "EVA-X",
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = EvaMint,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-            Text(
-                text = "千问/钉钉 Eva 具身桌面伴侣",
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFF8C9AB0),
-            )
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = "你好，我是 EVA-X（支持横屏底座模式 & 视觉人脸跟随）",
-            style = MaterialTheme.typography.titleSmall,
-            color = Color.White,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            text = "把手机横放或点击顶部「横屏 Eva 模式」即可切换千问 Eva 同款翡翠灵眸横屏形态；面对前置镜头移动头部，眼睛会实时看向你。",
-            style = MaterialTheme.typography.bodySmall,
-            color = Color(0xFF9BA6BC),
-        )
-    }
-}
-
-@Composable
-private fun HudMessageCard(message: ConversationMessage) {
-    val isUser = message.role == MessageRole.USER
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = if (isUser) Color(0xFF11221E) else Color(0xFF111622),
-        border = BorderStroke(
-            width = 1.dp,
-            color = if (isUser) EvaMint.copy(alpha = 0.35f) else HudViolet.copy(alpha = 0.25f),
-        ),
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = if (isUser) EvaMint.copy(alpha = 0.15f) else HudViolet.copy(alpha = 0.15f),
-                    border = BorderStroke(
-                        0.8.dp,
-                        if (isUser) EvaMint.copy(alpha = 0.5f) else HudViolet.copy(alpha = 0.5f),
-                    ),
-                ) {
-                    Text(
-                        text = if (isUser) "你" else "EVA-X",
-                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 2.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (isUser) EvaMint else HudViolet,
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-                if (message.isSample) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        if (message.sampleLabel != "演示数据") {
-                            Text(
-                                text = message.sampleLabel,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = HudCyan,
-                                fontWeight = FontWeight.Medium,
-                            )
-                        }
-                        Text(
-                            text = "演示数据",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EvaMint,
-                            fontWeight = FontWeight.Medium,
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(5.dp))
-            Text(
-                text = message.text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFFF2F6FC),
-            )
-            message.followUps.forEach { followUp ->
-                Row(
-                    modifier = Modifier.padding(top = 3.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = "•",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = EvaMint,
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = followUp,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFFB8C4D9),
-                    )
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(candidate.title, color = if (mode == candidate) CompanionAccent else MaterialTheme.colorScheme.onSurface)
+                    Text(candidate.subtitle, color = CompanionMuted, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
@@ -1410,370 +580,24 @@ private fun HudMessageCard(message: ConversationMessage) {
 }
 
 @Composable
-private fun HudStreamingReplyCard(
-    text: String,
-    latencyMs: Long?,
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = Color(0xFF0E1D24),
-        border = BorderStroke(1.2.dp, EvaMint.copy(alpha = 0.7f)),
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "⚡ EVA-X 实时流式语音回复中…",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = EvaMint,
-                    fontWeight = FontWeight.Bold,
-                )
-                if (latencyMs != null && latencyMs > 0L) {
-                    Text(
-                        text = "首句 ${latencyMs}ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = HudCyan,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-            }
-            Spacer(Modifier.height(5.dp))
-            Text(
-                text = "$text ▍",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFFF2FBF7),
-            )
-        }
+private fun SettingsAction(label: String, value: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label)
+        TextButton(onClick = onClick) { Text(value) }
     }
 }
 
 @Composable
-private fun PcControlDeck(
-    enabled: Boolean,
-    compact: Boolean,
-    borderBrush: Brush,
-    onSubmit: (String) -> Unit,
-) {
-    val verticalPad = if (compact) 8.dp else 10.dp
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(HudGlassBg)
-            .border(1.2.dp, borderBrush, RoundedCornerShape(20.dp))
-            .padding(horizontal = 10.dp, vertical = verticalPad),
-    ) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                DeckActionTile(
-                    title = "查今天的安排",
-                    iconType = DeckIconType.CALENDAR,
-                    enabled = enabled,
-                    compact = compact,
-                    onClick = { onSubmit("查今天的安排") },
-                    modifier = Modifier.weight(1f),
-                )
-                DeckActionTile(
-                    title = "整理会议纪要",
-                    iconType = DeckIconType.EDIT,
-                    enabled = enabled,
-                    compact = compact,
-                    onClick = { onSubmit("整理会议纪要") },
-                    modifier = Modifier.weight(1f),
-                )
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                DeckActionTile(
-                    title = "DSH 项目工作台",
-                    iconType = DeckIconType.MONITOR,
-                    enabled = enabled,
-                    compact = compact,
-                    onClick = { onSubmit("查看一下电脑上的DSH项目工作台和飞书成果状态") },
-                    modifier = Modifier.weight(1f),
-                )
-                DeckActionTile(
-                    title = "建 DSH 交付任务",
-                    iconType = DeckIconType.BOLT,
-                    enabled = enabled,
-                    compact = compact,
-                    onClick = { onSubmit("帮我建个交付任务：自动检查EVA-X网关与桌面伴侣状态") },
-                    modifier = Modifier.weight(1f),
-                )
+private fun ImmersiveSheetWindow() {
+    val view = LocalView.current
+    DisposableEffect(view) {
+        val window = (view.parent as? DialogWindowProvider)?.window
+        if (window != null) {
+            WindowCompat.getInsetsController(window, view).apply {
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(WindowInsetsCompat.Type.systemBars())
             }
         }
-    }
-}
-
-private enum class DeckIconType {
-    CALENDAR,
-    EDIT,
-    MONITOR,
-    BOLT,
-}
-
-@Composable
-private fun DeckActionTile(
-    title: String,
-    iconType: DeckIconType,
-    enabled: Boolean,
-    compact: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier,
-        shape = RoundedCornerShape(14.dp),
-        color = HudTileBg,
-        border = BorderStroke(1.dp, Color(0xFF252F42)),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = if (compact) 8.dp else 11.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(if (compact) 28.dp else 32.dp)
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(Color(0xFF1E2638)),
-                contentAlignment = Alignment.Center,
-            ) {
-                DeckTileVectorIcon(iconType)
-            }
-            Spacer(Modifier.width(9.dp))
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.5.sp),
-                color = if (enabled) Color(0xFFF0F4FA) else Color(0xFF6C768A),
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-@Composable
-private fun DeckTileVectorIcon(type: DeckIconType) {
-    Canvas(modifier = Modifier.size(16.dp)) {
-        val stroke = 1.6.dp.toPx()
-        val color = Color(0xFFB8C7E0)
-        when (type) {
-            DeckIconType.CALENDAR -> {
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(size.width * 0.12f, size.height * 0.2f),
-                    size = Size(size.width * 0.76f, size.height * 0.68f),
-                    cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
-                    style = Stroke(width = stroke),
-                )
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.12f, size.height * 0.42f),
-                    end = Offset(size.width * 0.88f, size.height * 0.42f),
-                    strokeWidth = stroke,
-                )
-            }
-
-            DeckIconType.EDIT -> {
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.2f, size.height * 0.8f),
-                    end = Offset(size.width * 0.8f, size.height * 0.2f),
-                    strokeWidth = stroke * 1.2f,
-                    cap = StrokeCap.Round,
-                )
-            }
-
-            DeckIconType.MONITOR -> {
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(size.width * 0.1f, size.height * 0.16f),
-                    size = Size(size.width * 0.8f, size.height * 0.54f),
-                    cornerRadius = CornerRadius(2.5.dp.toPx(), 2.5.dp.toPx()),
-                    style = Stroke(width = stroke),
-                )
-                drawLine(
-                    color = color,
-                    start = Offset(size.width * 0.3f, size.height * 0.84f),
-                    end = Offset(size.width * 0.7f, size.height * 0.84f),
-                    strokeWidth = stroke,
-                    cap = StrokeCap.Round,
-                )
-            }
-
-            DeckIconType.BOLT -> {
-                val path = Path().apply {
-                    moveTo(size.width * 0.56f, size.height * 0.10f)
-                    lineTo(size.width * 0.24f, size.height * 0.54f)
-                    lineTo(size.width * 0.50f, size.height * 0.54f)
-                    lineTo(size.width * 0.42f, size.height * 0.90f)
-                    lineTo(size.width * 0.76f, size.height * 0.44f)
-                    lineTo(size.width * 0.50f, size.height * 0.44f)
-                    close()
-                }
-                drawPath(path, color = EvaMint, style = Stroke(width = stroke, join = StrokeJoin.Round))
-            }
-        }
-    }
-}
-
-@Composable
-private fun HudBottomComposerBar(
-    draft: String,
-    isProcessing: Boolean,
-    isSpeaking: Boolean,
-    canSpeak: Boolean,
-    onDraftChanged: (String) -> Unit,
-    onSubmit: () -> Unit,
-    onMicClick: () -> Unit,
-    onSpeakLatest: () -> Unit,
-    onStopSpeaking: () -> Unit,
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(28.dp),
-        color = Color(0xFF0E131D),
-        border = BorderStroke(1.dp, Color(0xFF253146)),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = onDraftChanged,
-                    modifier = Modifier.weight(1f),
-                    placeholder = {
-                        Text(
-                            text = "向 EVA-X 发送指令…",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF7D899E),
-                        )
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(20.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = EvaMint.copy(alpha = 0.65f),
-                        unfocusedBorderColor = Color(0xFF202A3C),
-                        focusedContainerColor = Color(0xFF090C12),
-                        unfocusedContainerColor = Color(0xFF090C12),
-                    ),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(onSend = { onSubmit() }),
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = onSubmit,
-                    enabled = draft.isNotBlank() && !isProcessing,
-                    shape = RoundedCornerShape(18.dp),
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = EvaMint,
-                        contentColor = Color(0xFF041014),
-                        disabledContainerColor = Color(0xFF1A2232),
-                        disabledContentColor = Color(0xFF5D687D),
-                    ),
-                ) {
-                    Text("发送", fontWeight = FontWeight.Bold)
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Surface(
-                    onClick = onMicClick,
-                    enabled = !isProcessing,
-                    modifier = Modifier.weight(1.35f),
-                    shape = RoundedCornerShape(50),
-                    color = Color(0xFF131D2B),
-                    border = BorderStroke(
-                        width = 1.2.dp,
-                        brush = Brush.horizontalGradient(
-                            colors = listOf(EvaMint, HudCyan),
-                        ),
-                    ),
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 9.dp, horizontal = 12.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(EvaMint),
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = "语音输入",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = Color.White,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            text = " · 点我说话",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EvaMint,
-                        )
-                    }
-                }
-
-                if (isSpeaking) {
-                    OutlinedButton(
-                        onClick = onStopSpeaking,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(50),
-                        border = BorderStroke(1.dp, EvaMint.copy(alpha = 0.6f)),
-                        contentPadding = PaddingValues(vertical = 8.dp),
-                    ) {
-                        Text(
-                            text = "停止播报",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = EvaMint,
-                        )
-                    }
-                } else {
-                    OutlinedButton(
-                        onClick = onSpeakLatest,
-                        enabled = canSpeak,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(50),
-                        border = BorderStroke(1.dp, Color(0xFF263247)),
-                        contentPadding = PaddingValues(vertical = 8.dp),
-                    ) {
-                        Text(
-                            text = "朗读回复",
-                            style = MaterialTheme.typography.labelMedium,
-                        )
-                    }
-                }
-            }
-        }
+        onDispose { }
     }
 }
