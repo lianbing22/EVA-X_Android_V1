@@ -27,7 +27,8 @@ class GatewayAssistantEngineTest {
             val events = collect(server.config)
             val progress = events.filterIsInstance<AssistantEvent.Progress>().single()
             val result = events.filterIsInstance<AssistantEvent.Completed>().single().result
-            assertEquals(AssistantSource.PC_GATEWAY, events.filterIsInstance<AssistantEvent.SourceChanged>().single().source)
+            assertTrue(events.filterIsInstance<AssistantEvent.SourceChanged>().all { it.source == AssistantSource.PC_GATEWAY })
+            assertEquals("WorkBuddy 官方回复", events.filterIsInstance<AssistantEvent.SourceChanged>().last().label)
             assertEquals(2, progress.index)
             assertEquals(5, progress.total)
             assertEquals("官方助理回复", result.text)

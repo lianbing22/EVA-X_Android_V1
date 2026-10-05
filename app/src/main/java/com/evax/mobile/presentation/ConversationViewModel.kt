@@ -176,6 +176,7 @@ class ConversationViewModel(
                             }
                             receivedResult = true
                             val resultKind = resultFeedback(event.result)
+                            val agentFailure = event.result.outcome == AssistantOutcome.FAILED && event.result.evidence?.source == "agy_cli_agent"
                             if (!isCurrentTask(taskId)) return@collect
                             val resultSource = event.result.source.takeUnless {
                                 it == AssistantSource.UNCONFIRMED
@@ -202,7 +203,9 @@ class ConversationViewModel(
                                     currentStep = null,
                                     streamingReply = null,
                                     source = resultSource,
-                                    gatewayLabel = if (resultSource != state.source) {
+                                    gatewayLabel = if (resultSource == AssistantSource.PC_GATEWAY) {
+                                        event.result.sampleLabel
+                                    } else if (resultSource != state.source) {
                                         sourceLabel(resultSource)
                                     } else {
                                         state.gatewayLabel
@@ -210,10 +213,10 @@ class ConversationViewModel(
                                     notice = resultNotice(resultKind) ?: state.notice.takeIf {
                                         state.voicePlayback.playbackEvent == VoicePlaybackEvent.ERROR
                                     },
-                                    canRetryTask = resultKind !in setOf(AvatarFeedbackKind.UNCERTAIN, AvatarFeedbackKind.NEEDS_ATTENTION, AvatarFeedbackKind.REPLY_READY),
+                                    canRetryTask = !agentFailure && resultKind !in setOf(AvatarFeedbackKind.UNCERTAIN, AvatarFeedbackKind.NEEDS_ATTENTION, AvatarFeedbackKind.REPLY_READY),
                                     isProcessing = false,
                                     avatarFeedback = feedback(resultKind),
-                                    pendingAttention = resultKind == AvatarFeedbackKind.UNCERTAIN || resultKind == AvatarFeedbackKind.NEEDS_ATTENTION,
+                                    pendingAttention = agentFailure || resultKind == AvatarFeedbackKind.UNCERTAIN || resultKind == AvatarFeedbackKind.NEEDS_ATTENTION,
                                 )
                             }
                             scheduleReturnToIdle(taskId)
@@ -230,11 +233,16 @@ class ConversationViewModel(
                 throw cancellation
             } catch (failure: Throwable) {
                 if (isCurrentTask(taskId)) {
+                    val kind = failureFeedback(failure)
+                    val agentFailure = (failure as? GatewayException)?.let {
+                        it.outcome == AssistantOutcome.FAILED && it.evidence?.source == "agy_cli_agent"
+                    } == true
                     showEngineError(
                         if (failure is GatewayException) failure.userMessage else "刚才的任务中断了，执行结果尚不明确，请先查看电脑端状态。",
                         taskId,
-                        canRetryTask = (failure as? GatewayException)?.canRetryTask ?: false,
-                        kind = failureFeedback(failure),
+                        canRetryTask = !agentFailure && ((failure as? GatewayException)?.canRetryTask ?: false),
+                        kind = kind,
+                        requiresAttention = agentFailure || kind == AvatarFeedbackKind.NEEDS_ATTENTION || kind == AvatarFeedbackKind.UNCERTAIN,
                     )
                 }
             } finally {
@@ -399,7 +407,13 @@ class ConversationViewModel(
     private fun isCurrentTask(taskId: Long): Boolean =
         taskGeneration == taskId && mutableUiState.value.isProcessing
 
-    private fun showEngineError(message: String, taskId: Long, canRetryTask: Boolean = true, kind: AvatarFeedbackKind = AvatarFeedbackKind.FAILED) {
+    private fun showEngineError(
+        message: String,
+        taskId: Long,
+        canRetryTask: Boolean = true,
+        kind: AvatarFeedbackKind = AvatarFeedbackKind.FAILED,
+        requiresAttention: Boolean = kind == AvatarFeedbackKind.NEEDS_ATTENTION || kind == AvatarFeedbackKind.UNCERTAIN,
+    ) {
         if (!isCurrentTask(taskId)) return
         completedReturnJob?.cancel()
         mutableUiState.update { state ->
@@ -411,7 +425,7 @@ class ConversationViewModel(
                 canRetryTask = canRetryTask,
                 isProcessing = false,
                 avatarFeedback = feedback(kind),
-                pendingAttention = kind == AvatarFeedbackKind.NEEDS_ATTENTION || kind == AvatarFeedbackKind.UNCERTAIN,
+                pendingAttention = requiresAttention,
             )
         }
     }
@@ -449,7 +463,7 @@ class ConversationViewModel(
         return result.source == AssistantSource.PC_GATEWAY && !result.isSample &&
             result.requestId != null && result.requestId == currentRequestId &&
             result.taskId != null && result.taskId == mutableUiState.value.currentTaskId &&
-            evidence.source == "codebuddy_run_stream" && evidence.status == status &&
+            evidence.source in setOf("codebuddy_run_stream", "agy_cli_agent") && evidence.status == status &&
             evidence.verified && evidence.terminal
     }
 

@@ -47,7 +47,7 @@ class GatewayAssistantEngine(
         if (status.state != GatewayConnectionState.READY) {
             throw GatewayException(status.errorCode ?: "connection_failed", status.message)
         }
-        emit(AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "WorkBuddy 官方桥接"))
+        emit(AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "电脑已连接"))
         streamResponse(activeConfig, prompt) { emit(it) }
     }.flowOn(Dispatchers.IO)
 
@@ -273,10 +273,12 @@ class GatewayAssistantEngine(
                                     throw GatewayException("invalid_result", "电脑桥接未返回有效的 WorkBuddy 回复，未确认执行结果。")
                                 }
                                 receivedCompleted = true
+                                val sampleLabel = nullableString(json, "sampleLabel") ?: "WorkBuddy 官方回复"
+                                onEvent(AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, sampleLabel))
                                 // 流结束仅代表桥接响应结束；任务成功由结构化证据和当前任务标识共同确认。
                                 onEvent(AssistantEvent.Completed(AssistantResult(
                                     text = text,
-                                    sampleLabel = "WorkBuddy 官方回复",
+                                    sampleLabel = sampleLabel,
                                     followUps = followUps(json.optJSONArray("followUps")),
                                     isSample = false,
                                     source = AssistantSource.PC_GATEWAY,

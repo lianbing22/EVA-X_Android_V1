@@ -25,12 +25,19 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
 
     @Volatile
     private var isShutdown = false
+    private var isInitializing = true
 
     override val state = mutableState.asStateFlow()
 
     init {
-        textToSpeech = TextToSpeech(context.applicationContext) { status ->
-            onMain { initialize(status) }
+        textToSpeech = try {
+            TextToSpeech(context.applicationContext) { status ->
+                // 始终排队，确保构造返回并保存 engine 后再处理初始化回调。
+                mainHandler.post { initialize(status) }
+            }
+        } catch (_: Exception) {
+            mainHandler.post { initialize(TextToSpeech.ERROR) }
+            null
         }
     }
 
@@ -40,23 +47,19 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
 
     override fun speakChunk(text: String, flush: Boolean) {
         onMain {
-            val engine = textToSpeech ?: return@onMain
             val cleaned = text.trim()
-            if (isShutdown || !mutableState.value.isReady || cleaned.isBlank()) return@onMain
-
-            runCatching {
-                engine.setSpeechRate(currentSpeechRate)
-                engine.setPitch(1.03f)
-            }
-
+            if (isShutdown || cleaned.isBlank()) return@onMain
             val utteranceId = "eva-${utteranceSequence.incrementAndGet()}"
-            mutableState.value = playback.enqueue(utteranceId, flush)
-
-            val queueMode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            val result = runCatching { engine.speak(cleaned, queueMode, null, utteranceId) }.getOrDefault(TextToSpeech.ERROR)
-            if (result == TextToSpeech.ERROR) {
-                mutableState.value = playback.onError(utteranceId, TextToSpeech.ERROR)
+            if (isInitializing) {
+                mutableState.value = playback.defer(utteranceId, cleaned, flush)
+                return@onMain
             }
+            mutableState.value = playback.enqueue(utteranceId, flush)
+            if (!mutableState.value.isReady) {
+                mutableState.value = playback.onError(utteranceId, VoicePlaybackTracker.ERROR_INITIALIZATION)
+                return@onMain
+            }
+            sendToEngine(DeferredSpeech(utteranceId, cleaned, flush))
         }
     }
 
@@ -90,6 +93,7 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
         onMain {
             if (isShutdown) return@onMain
             isShutdown = true
+            isInitializing = false
             playback.stop()
             val engine = textToSpeech
             textToSpeech = null
@@ -101,29 +105,48 @@ class AndroidTextToSpeechController(context: Context) : SpeechOutputController {
 
     private fun initialize(status: Int) {
         if (isShutdown) return
+        isInitializing = false
         val engine = textToSpeech
         if (status != TextToSpeech.SUCCESS || engine == null) {
-            mutableState.value = playback.setReady(false)
+            mutableState.value = playback.initializationFailed(VoicePlaybackTracker.ERROR_INITIALIZATION)
             return
         }
 
         val languageStatus = runCatching { engine.setLanguage(Locale("zh", "CN")) }
             .getOrDefault(TextToSpeech.LANG_NOT_SUPPORTED)
-        val ready = languageStatus >= TextToSpeech.LANG_AVAILABLE
-        if (ready) {
-            runCatching {
-                engine.setSpeechRate(currentSpeechRate)
-                engine.setPitch(1.03f)
-            }
+        if (languageStatus < TextToSpeech.LANG_AVAILABLE) {
+            mutableState.value = playback.initializationFailed(VoicePlaybackTracker.ERROR_LANGUAGE_UNAVAILABLE)
+            return
+        }
+        val listenerStatus = runCatching {
             engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = onUtteranceStart(utteranceId)
                 override fun onDone(utteranceId: String?) = onUtteranceFinished(utteranceId, null, false)
                 override fun onError(utteranceId: String?) = onUtteranceFinished(utteranceId, null, true)
                 override fun onError(utteranceId: String?, errorCode: Int) = onUtteranceFinished(utteranceId, errorCode, true)
             })
+        }.getOrDefault(TextToSpeech.ERROR)
+        if (listenerStatus == TextToSpeech.ERROR) {
+            mutableState.value = playback.initializationFailed(VoicePlaybackTracker.ERROR_INITIALIZATION)
+            return
         }
         playback.setSpeechRate(currentSpeechRate)
-        mutableState.value = playback.setReady(ready)
+        mutableState.value = playback.setReady(true)
+        playback.takeDeferred().forEach(::sendToEngine)
+    }
+
+    private fun sendToEngine(utterance: DeferredSpeech) {
+        val engine = textToSpeech
+        if (isShutdown || engine == null) return
+        runCatching {
+            engine.setSpeechRate(currentSpeechRate)
+            engine.setPitch(1.03f)
+        }
+        val queueMode = if (utterance.flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        val result = runCatching { engine.speak(utterance.text, queueMode, null, utterance.utteranceId) }.getOrDefault(TextToSpeech.ERROR)
+        if (result == TextToSpeech.ERROR) {
+            mutableState.value = playback.onError(utterance.utteranceId, TextToSpeech.ERROR)
+        }
     }
 
     private fun onUtteranceStart(utteranceId: String?) {

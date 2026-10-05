@@ -250,7 +250,7 @@ class ConversationViewModelTest {
         runCurrent()
 
         assertEquals(AssistantSource.PC_GATEWAY, viewModel.uiState.value.source)
-        assertEquals("电脑网关", viewModel.uiState.value.gatewayLabel)
+        assertEquals("PC Gateway", viewModel.uiState.value.gatewayLabel)
         assertFalse(viewModel.uiState.value.messages.last().isSample)
     }
 
@@ -630,6 +630,31 @@ class ConversationViewModelTest {
     }
 
     @Test
+    fun agySuccessRequiresTheSameBoundTaskAndStructuredCompletedEvidence() = runTest(mainDispatcherRule.dispatcher) {
+        val valid = AssistantResult("本机 Agent 终态已确认", "本机 Agent", source = AssistantSource.PC_GATEWAY,
+            outcome = AssistantOutcome.TASK_SUCCEEDED, requestId = "agy-request", taskId = "agy-conversation",
+            evidence = ExecutionEvidence("agy_cli_agent", "completed", verified = true, terminal = true))
+        for ((result, bindTask) in listOf(
+            valid to true,
+            valid.copy(evidence = valid.evidence?.copy(status = "SUCCESS")) to true,
+            valid.copy(evidence = null) to true,
+            valid to false,
+            valid.copy(taskId = "other-conversation") to true,
+        )) {
+            engine.response = { flow {
+                emit(AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "电脑桥接"))
+                emit(AssistantEvent.RequestStarted("agy-request"))
+                if (bindTask) emit(AssistantEvent.Progress("Agent 已启动", 1, 3, "agy-conversation", "agy-request"))
+                emit(AssistantEvent.Completed(result))
+            } }
+            viewModel.submitPrompt("电脑任务")
+            runCurrent()
+            assertEquals(if (result == valid && bindTask) AvatarFeedbackKind.TASK_SUCCEEDED else AvatarFeedbackKind.UNCERTAIN,
+                viewModel.uiState.value.avatarFeedback?.kind)
+        }
+    }
+
+    @Test
     fun duplicateCompletionCannotAppendSpeakOrTriggerFeedbackAgain() = runTest(mainDispatcherRule.dispatcher) {
         val spoken = mutableListOf<String>()
         viewModel.setSpeechCallback { text, _ -> spoken += text }
@@ -726,6 +751,26 @@ class ConversationViewModelTest {
         assertEquals(null, viewModel.uiState.value.notice)
         assertFalse(viewModel.uiState.value.pendingAttention)
         assertEquals(retryBefore, viewModel.uiState.value.canRetryTask)
+    }
+
+    @Test
+    fun agyFailureStillNeedsComputerInspectionAndCannotEnableRetryOnDismiss() = runTest(mainDispatcherRule.dispatcher) {
+        val evidence = ExecutionEvidence("agy_cli_agent", "failed", true, true)
+        for (response in listOf<(String) -> Flow<AssistantEvent>>(
+            { flowOf(AssistantEvent.Completed(AssistantResult("Agent 任务失败", "本机 Agent",
+                source = AssistantSource.PC_GATEWAY, outcome = AssistantOutcome.FAILED, evidence = evidence))) },
+            { flow { throw GatewayException("TASK_FAILED", "Agent 任务失败", outcome = AssistantOutcome.FAILED, evidence = evidence) } },
+        )) {
+            engine.response = response
+            viewModel.submitPrompt("电脑任务")
+            runCurrent()
+            assertEquals(AvatarFeedbackKind.FAILED, viewModel.uiState.value.avatarFeedback?.kind)
+            assertTrue(viewModel.uiState.value.pendingAttention)
+            assertFalse(viewModel.uiState.value.canRetryTask)
+            viewModel.clearNotice()
+            assertTrue(viewModel.uiState.value.pendingAttention)
+            assertFalse(viewModel.uiState.value.canRetryTask)
+        }
     }
 }
 

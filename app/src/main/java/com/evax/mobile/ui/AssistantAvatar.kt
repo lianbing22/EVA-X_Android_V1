@@ -298,7 +298,7 @@ fun AssistantAvatar(
     }
     val semanticLabel = when {
         behavior?.scene != null -> "待机小剧场，${behavior.scene.label}，虚构场景"
-        resting -> companionMode.title
+        companionMode != EvaCompanionMode.COMPANION -> companionMode.title
         phase == AssistantPhase.LISTENING -> when (listeningStage) {
             ListeningStage.PREPARING -> "正在准备麦克风"
             ListeningStage.READY -> "请说话"
