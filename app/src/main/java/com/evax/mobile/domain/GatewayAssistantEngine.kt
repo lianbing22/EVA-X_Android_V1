@@ -21,24 +21,30 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** 仅连接通过配对的 WorkBuddy 官方 Open API 桥接，不自动切换到演示数据。 */
+/** 仅连接通过配对的 WorkBuddy 官方桥接（支持局域网直连与配对码加密公网长连接隧道自动切换），不自动切换到演示数据。 */
 class GatewayAssistantEngine(
     private val configProvider: () -> GatewayConnectionConfig,
+    private val beaconResolver: (suspend (String) -> GatewayTunnelBeacon?)? = null,
+    private val onEndpointDiscovered: ((String) -> Unit)? = null,
 ) : AssistantEngine {
+    @Volatile
+    private var cachedDiscoveredEndpoint: String? = null
+
     override fun respond(prompt: String): Flow<AssistantEvent> = flow {
         // 单次请求使用完整配置快照，保存新设置不会把正在执行的请求切到另一台电脑。
-        val config = configProvider().validated()
-        val status = checkConnection(config)
+        val baseConfig = configProvider().validated()
+        val (activeConfig, status) = resolveAndCheckConnection(baseConfig)
         if (status.state != GatewayConnectionState.READY) {
             throw GatewayException(status.errorCode ?: "connection_failed", status.message)
         }
         emit(AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "WorkBuddy 官方桥接"))
-        streamResponse(config, prompt) { emit(it) }
+        streamResponse(activeConfig, prompt) { emit(it) }
     }.flowOn(Dispatchers.IO)
 
     suspend fun testConnection(config: GatewayConnectionConfig): GatewayConnectionStatus = withContext(Dispatchers.IO) {
         try {
-            checkConnection(config.validated())
+            val (_, status) = resolveAndCheckConnection(config.validated())
+            status
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (failure: GatewayException) {
@@ -59,6 +65,60 @@ class GatewayAssistantEngine(
         }
     }
 
+    private suspend fun resolveAndCheckConnection(
+        baseConfig: GatewayConnectionConfig,
+    ): Pair<GatewayConnectionConfig, GatewayConnectionStatus> {
+        val primaryFailure: GatewayException = try {
+            val status = checkConnection(baseConfig)
+            return baseConfig to status
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: GatewayException) {
+            if (!shouldAttemptRemoteDiscovery(failure) || beaconResolver == null) {
+                throw failure
+            }
+            failure
+        } catch (failure: Exception) {
+            currentCoroutineContext().ensureActive()
+            val mapped = networkFailure(failure)
+            if (beaconResolver == null) throw mapped
+            mapped
+        }
+
+        // 当配置的局域网地址或旧公网隧道地址不可达时，自动通过配对码解密最新跨网长连接信标
+        val beacon = runCatching { beaconResolver?.invoke(baseConfig.pairingToken) }.getOrNull()
+        val candidates = buildList {
+            if (beacon != null) {
+                add(beacon.tunnelUrl)
+                if (!beacon.lanUrl.isNullOrBlank()) add(beacon.lanUrl)
+            }
+            cachedDiscoveredEndpoint?.let { add(it) }
+        }.map { it.trim().trimEnd('/') }
+            .filter { it.isNotEmpty() && it != baseConfig.endpoint }
+            .distinct()
+
+        for (candidateEndpoint in candidates) {
+            val candidateConfig = runCatching {
+                baseConfig.copy(endpoint = candidateEndpoint).validated()
+            }.getOrNull() ?: continue
+            try {
+                val status = checkConnection(candidateConfig)
+                cachedDiscoveredEndpoint = candidateConfig.endpoint
+                runCatching { onEndpointDiscovered?.invoke(candidateConfig.endpoint) }
+                return candidateConfig to status
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (_: Exception) {
+                // 继续尝试下一个候选地址
+            }
+        }
+        throw primaryFailure
+    }
+
+    private fun shouldAttemptRemoteDiscovery(failure: GatewayException): Boolean =
+        failure.code in setOf("connection_failed", "connection_timeout", "http_error", "protocol_mismatch")
+
+
     private suspend fun checkConnection(config: GatewayConnectionConfig): GatewayConnectionStatus {
         val health = getJson(config, "/healthz", authenticated = false)
         if (!health.optBoolean("ok") || health.optString("protocol") != PROTOCOL) {
@@ -67,6 +127,10 @@ class GatewayAssistantEngine(
         val json = getJson(config, "/api/connection", authenticated = true)
         if (json.optString("provider") != "workbuddy") {
             throw GatewayException("protocol_mismatch", "连接状态不是 WorkBuddy，无法提交真实电脑任务。")
+        }
+        val reportedTunnelUrl = json.optString("tunnelUrl").trim().trimEnd('/')
+        if (reportedTunnelUrl.startsWith("https://")) {
+            cachedDiscoveredEndpoint = reportedTunnelUrl
         }
         val configured = json.optBoolean("configured")
         val authorized = json.optBoolean("authorized")

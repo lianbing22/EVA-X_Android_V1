@@ -38,4 +38,27 @@ class GatewayConnectionConfigTest {
             }
         }
     }
+
+    @Test
+    fun tunnelBeaconEncryptsDecryptsAndRejectsWrongPairingToken() {
+        val token = "YvpyZ4nG0d_AlDqMP4MjWW_oDi7kfMrPF3O2x-PgTnk"
+        val topic = TunnelBeaconResolver.deriveDiscoveryTopic(token)
+        assertTrue(topic.matches(Regex("^evax-wb-[0-9a-f]{28}$")))
+
+        val envelope = TunnelBeaconResolver.encryptTunnelBeacon(
+            pairingToken = token,
+            tunnelUrl = "https://a4d12a64ae15ca.lhr.life",
+            lanUrl = "http://192.168.2.4:3099",
+            updatedAt = "2026-10-05T05:27:12.197Z",
+        )
+        assertFalse(envelope.contains("lhr.life"))
+
+        val decrypted = TunnelBeaconResolver.decryptTunnelBeacon(token, envelope)
+        assertNotNull(decrypted)
+        assertEquals("https://a4d12a64ae15ca.lhr.life", decrypted?.tunnelUrl)
+        assertEquals("http://192.168.2.4:3099", decrypted?.lanUrl)
+
+        assertNull(TunnelBeaconResolver.decryptTunnelBeacon("wrong-pairing-token", envelope))
+    }
 }
+

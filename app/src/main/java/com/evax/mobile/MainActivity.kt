@@ -39,6 +39,7 @@ import com.evax.mobile.domain.GatewayConnectionState
 import com.evax.mobile.domain.GatewayConnectionStatus
 import com.evax.mobile.domain.GatewayException
 import com.evax.mobile.domain.SpeechInputFailure
+import com.evax.mobile.domain.TunnelBeaconResolver
 import com.evax.mobile.platform.gateway.GatewayConfigStore
 import com.evax.mobile.platform.vision.CameraFaceTracker
 import com.evax.mobile.platform.voice.AndroidSpeechInputController
@@ -57,7 +58,24 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private val gatewayConfigStore by lazy { GatewayConfigStore(applicationContext) }
-    private val gatewayEngine by lazy { GatewayAssistantEngine(configProvider = gatewayConfigStore::load) }
+    private val gatewayEngine by lazy {
+        GatewayAssistantEngine(
+            configProvider = gatewayConfigStore::load,
+            beaconResolver = { token ->
+                if (isRunningInstrumentationTest()) null else TunnelBeaconResolver.resolve(token)
+            },
+            onEndpointDiscovered = { discoveredEndpoint ->
+                val current = gatewayConfig
+                if (current.isConfigured && current.endpoint != discoveredEndpoint) {
+                    val updated = current.copy(endpoint = discoveredEndpoint)
+                    runCatching { gatewayConfigStore.save(updated) }
+                    lifecycleScope.launch(Dispatchers.Main) {
+                        gatewayConfig = updated
+                    }
+                }
+            },
+        )
+    }
     private var gatewayConfig by mutableStateOf(GatewayConnectionConfig())
     private var gatewayStatus by mutableStateOf(GatewayConnectionStatus())
     private var gatewayOperationJob: Job? = null
@@ -106,7 +124,7 @@ class MainActivity : ComponentActivity() {
                     android.os.Build.MODEL.contains("sdk", ignoreCase = true) ||
                     android.os.Build.HARDWARE.contains("ranchu", ignoreCase = true)
                 loaded = GatewayConnectionConfig(
-                    endpoint = if (isEmulator) "http://10.0.2.2:3099" else "http://192.168.2.4:3099",
+                    endpoint = if (isEmulator) "http://10.0.2.2:3099" else "https://a4d12a64ae15ca.lhr.life",
                     pairingToken = "YvpyZ4nG0d_AlDqMP4MjWW_oDi7kfMrPF3O2x-PgTnk",
                 )
                 runCatching { gatewayConfigStore.save(loaded) }
