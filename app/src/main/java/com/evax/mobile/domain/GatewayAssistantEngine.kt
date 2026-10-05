@@ -30,6 +30,10 @@ class GatewayAssistantEngine(
     @Volatile
     private var cachedDiscoveredEndpoint: String? = null
 
+    @Volatile
+    var lastResolvedEndpoint: String? = null
+        private set
+
     override fun respond(prompt: String): Flow<AssistantEvent> = flow {
         // 单次请求使用完整配置快照，保存新设置不会把正在执行的请求切到另一台电脑。
         val baseConfig = configProvider().validated()
@@ -70,6 +74,7 @@ class GatewayAssistantEngine(
     ): Pair<GatewayConnectionConfig, GatewayConnectionStatus> {
         val primaryFailure: GatewayException = try {
             val status = checkConnection(baseConfig)
+            lastResolvedEndpoint = baseConfig.endpoint
             return baseConfig to status
         } catch (cancellation: CancellationException) {
             throw cancellation
@@ -104,6 +109,7 @@ class GatewayAssistantEngine(
             try {
                 val status = checkConnection(candidateConfig)
                 cachedDiscoveredEndpoint = candidateConfig.endpoint
+                lastResolvedEndpoint = candidateConfig.endpoint
                 runCatching { onEndpointDiscovered?.invoke(candidateConfig.endpoint) }
                 return candidateConfig to status
             } catch (cancellation: CancellationException) {

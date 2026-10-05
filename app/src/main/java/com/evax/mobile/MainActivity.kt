@@ -65,12 +65,14 @@ class MainActivity : ComponentActivity() {
                 if (isRunningInstrumentationTest()) null else TunnelBeaconResolver.resolve(token)
             },
             onEndpointDiscovered = { discoveredEndpoint ->
-                val current = gatewayConfig
+                val current = runCatching { gatewayConfigStore.load() }.getOrDefault(gatewayConfig)
                 if (current.isConfigured && current.endpoint != discoveredEndpoint) {
                     val updated = current.copy(endpoint = discoveredEndpoint)
                     runCatching { gatewayConfigStore.save(updated) }
                     lifecycleScope.launch(Dispatchers.Main) {
-                        gatewayConfig = updated
+                        if (!gatewayStatus.isTesting) {
+                            gatewayConfig = updated
+                        }
                     }
                 }
             },
@@ -120,11 +122,8 @@ class MainActivity : ComponentActivity() {
         try {
             var loaded = gatewayConfigStore.load()
             if (!loaded.isConfigured && !isRunningInstrumentationTest()) {
-                val isEmulator = android.os.Build.FINGERPRINT.contains("generic") ||
-                    android.os.Build.MODEL.contains("sdk", ignoreCase = true) ||
-                    android.os.Build.HARDWARE.contains("ranchu", ignoreCase = true)
                 loaded = GatewayConnectionConfig(
-                    endpoint = if (isEmulator) "http://10.0.2.2:3099" else "https://a4d12a64ae15ca.lhr.life",
+                    endpoint = "https://ca9215c26a5023.lhr.life",
                     pairingToken = "YvpyZ4nG0d_AlDqMP4MjWW_oDi7kfMrPF3O2x-PgTnk",
                 )
                 runCatching { gatewayConfigStore.save(loaded) }
@@ -445,7 +444,18 @@ class MainActivity : ComponentActivity() {
         gatewayStatus = GatewayConnectionStatus(state = GatewayConnectionState.CHECKING, message = "正在检查桥接、授权与助理在线状态…")
         gatewayOperationJob = lifecycleScope.launch {
             val checked = gatewayEngine.testConnection(config)
-            if (operation == gatewayOperationGeneration) gatewayStatus = checked
+            if (operation == gatewayOperationGeneration) {
+                val resolvedEndpoint = gatewayEngine.lastResolvedEndpoint
+                if (checked.state == GatewayConnectionState.READY &&
+                    !resolvedEndpoint.isNullOrBlank() &&
+                    resolvedEndpoint != gatewayConfig.endpoint
+                ) {
+                    val updated = config.copy(endpoint = resolvedEndpoint)
+                    runCatching { gatewayConfigStore.save(updated) }
+                    gatewayConfig = updated
+                }
+                gatewayStatus = checked
+            }
         }
     }
 
