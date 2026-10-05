@@ -188,13 +188,55 @@ fun ConversationScreen(
             ) {
                 if (mode != EvaCompanionMode.REST) {
                     when {
-                        state.isProcessing -> TaskPeek(state, onCancelTask)
+                        state.isProcessing -> TaskPeek(state, onCancelTask, latestUser?.text)
                         state.phase == AssistantPhase.LISTENING -> {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                SymmetricAudioWaveform(AssistantPhase.LISTENING, isSpeaking = false, modifier = Modifier.width(112.dp).height(24.dp), micLevel = liveMicLevel, reduceMotion = reduceMotion)
-                                Spacer(Modifier.width(12.dp))
-                                Text("正在聆听", color = CompanionAccent)
-                                TextButton(onClick = onStopListening) { Text("停止") }
+                            Surface(
+                                color = CompanionSurface,
+                                shape = RoundedCornerShape(20.dp),
+                                border = BorderStroke(1.dp, CompanionAccent.copy(alpha = 0.28f)),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(
+                                    Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Row(
+                                        Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            SymmetricAudioWaveform(
+                                                AssistantPhase.LISTENING,
+                                                isSpeaking = false,
+                                                modifier = Modifier.width(96.dp).height(24.dp),
+                                                micLevel = liveMicLevel,
+                                                reduceMotion = reduceMotion,
+                                            )
+                                            Spacer(Modifier.width(10.dp))
+                                            Text("正在聆听", color = CompanionAccent, style = MaterialTheme.typography.labelLarge)
+                                        }
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            if (state.draft.isNotBlank()) {
+                                                TextButton(onClick = {
+                                                    val text = state.draft
+                                                    onStopListening()
+                                                    onSubmit(text)
+                                                }) {
+                                                    Text("立即发送", color = CompanionAccent)
+                                                }
+                                            }
+                                            TextButton(onClick = onStopListening) { Text("停止") }
+                                        }
+                                    }
+                                    Text(
+                                        text = if (state.draft.isNotBlank()) "“${state.draft}”" else "请说话，正在实时转译文字…",
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = if (state.draft.isNotBlank()) MaterialTheme.colorScheme.onBackground else CompanionMuted,
+                                        maxLines = 3,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
                             }
                         }
                         state.notice != null -> Surface(
@@ -228,9 +270,19 @@ fun ConversationScreen(
                                 Modifier.fillMaxWidth().clickable { panel = "conversation" }
                                     .semantics { contentDescription = "查看回复详情" },
                                 horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
                             ) {
                                 if (latest?.isSample == true) {
                                     Text("演示数据", style = MaterialTheme.typography.labelSmall, color = CompanionMuted)
+                                }
+                                if (latestUser != null) {
+                                    Text(
+                                        "“${latestUser.text}”",
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = CompanionMuted,
+                                    )
                                 }
                                 Text(
                                     latest?.text.orEmpty(), maxLines = 2,
@@ -368,7 +420,7 @@ fun ConversationScreen(
 }
 
 @Composable
-private fun TaskPeek(state: ConversationUiState, onCancel: () -> Unit) {
+private fun TaskPeek(state: ConversationUiState, onCancel: () -> Unit, latestUserText: String? = null) {
     Surface(
         Modifier.fillMaxWidth(), color = CompanionSurface,
         shape = RoundedCornerShape(20.dp),
@@ -379,7 +431,22 @@ private fun TaskPeek(state: ConversationUiState, onCancel: () -> Unit) {
                 Text(if (state.phase == AssistantPhase.THINKING) "正在理解" else "正在执行", style = MaterialTheme.typography.labelLarge, color = CompanionAccent)
                 TextButton(onClick = onCancel) { Text("停止接收") }
             }
-            Text(state.currentStep ?: "正在准备，请稍候…", style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (!latestUserText.isNullOrBlank()) {
+                Text(
+                    "你：$latestUserText",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = CompanionMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            val previewText = state.streamingReply?.takeIf { it.isNotBlank() } ?: state.currentStep ?: "正在准备，请稍候…"
+            Text(
+                previewText,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = if (!state.streamingReply.isNullOrBlank()) 3 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (state.progressTotal > 0) {
                 LinearProgressIndicator(
                     progress = { (state.completedProgressSteps.size.toFloat() / state.progressTotal).coerceIn(0f, 1f) },

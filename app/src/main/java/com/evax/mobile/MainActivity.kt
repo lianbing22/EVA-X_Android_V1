@@ -123,7 +123,7 @@ class MainActivity : ComponentActivity() {
             var loaded = gatewayConfigStore.load()
             if (!loaded.isConfigured && !isRunningInstrumentationTest()) {
                 loaded = GatewayConnectionConfig(
-                    endpoint = "https://ca9215c26a5023.lhr.life",
+                    endpoint = "https://b97fd12c20cd1d.lhr.life",
                     pairingToken = "YvpyZ4nG0d_AlDqMP4MjWW_oDi7kfMrPF3O2x-PgTnk",
                 )
                 runCatching { gatewayConfigStore.save(loaded) }
@@ -353,6 +353,7 @@ class MainActivity : ComponentActivity() {
             speechOutputController.stop()
         }
         onUpdateMicLevel(0f)
+        conversationViewModel.onDraftChanged("")
         conversationViewModel.onListeningStarted()
         speechInputController.start(
             onResult = { text -> onUpdateMicLevel(0f); conversationViewModel.onSpeechResult(text) },

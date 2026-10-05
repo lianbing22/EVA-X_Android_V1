@@ -140,13 +140,22 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
             override fun onEvent(eventType: Int, params: Bundle?) = Unit
 
             override fun onPartialResults(partialResults: Bundle?) {
-                val partial = partialResults
+                val stable = partialResults
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull { it.isNotBlank() }
                     .orEmpty()
-                if (partial.isNotBlank()) {
-                    lastPartialText = partial
-                    onPartialResult(partial)
+                val unstable = partialResults
+                    ?.getStringArrayList("android.speech.extra.UNSTABLE_TEXT")
+                    ?.firstOrNull { it.isNotBlank() }
+                    .orEmpty()
+                val combined = when {
+                    stable.isNotBlank() && unstable.isNotBlank() && !stable.endsWith(unstable) -> "$stable$unstable"
+                    stable.isNotBlank() -> stable
+                    else -> unstable
+                }.trim()
+                if (combined.isNotBlank()) {
+                    lastPartialText = combined
+                    onPartialResult(combined)
                 }
             }
 
