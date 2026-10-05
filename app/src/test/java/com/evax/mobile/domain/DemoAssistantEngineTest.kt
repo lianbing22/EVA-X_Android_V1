@@ -51,4 +51,15 @@ class DemoAssistantEngineTest {
         assertEquals(listOf("整理会议内容", "提取待办", "生成摘要"), steps)
         assertTrue(result.text != "下午 3 点有客户需求讨论，5 点有项目复盘。")
     }
+
+    @Test
+    fun allDemoRoutesRetainDemoSourceAndSampleLabelOnSuccess() = runTest {
+        for (prompt in listOf("整理会议", "查询日程", "分析屏幕", "电脑 Agent", "钉钉发消息", "生成周报", "你好")) {
+            val result = engine.respond(prompt).toList().filterIsInstance<AssistantEvent.Completed>().single().result
+            assertEquals(AssistantSource.LOCAL_DEMO, result.source)
+            assertEquals(AssistantOutcome.TASK_SUCCEEDED, result.outcome)
+            assertTrue(result.isSample)
+            assertEquals("演示数据", result.sampleLabel)
+        }
+    }
 }

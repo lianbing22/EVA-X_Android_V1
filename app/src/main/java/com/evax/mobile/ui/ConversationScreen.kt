@@ -3,8 +3,6 @@ package com.evax.mobile.ui
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -26,8 +24,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -79,9 +79,15 @@ fun ConversationScreen(
     onSaveGatewayConfig: (GatewayConnectionConfig) -> Unit = {},
     onTestGatewayConnection: (GatewayConnectionConfig) -> Unit = {},
 ) {
+    val context = LocalContext.current
+    val preferences = remember(context) { context.getSharedPreferences("companion_behavior", android.content.Context.MODE_PRIVATE) }
     var panel by rememberSaveable { mutableStateOf<String?>(null) }
     var modeOrdinal by rememberSaveable { mutableIntStateOf(EvaCompanionMode.COMPANION.ordinal) }
-    var reduceMotion by rememberSaveable { mutableStateOf(false) }
+    var reduceMotion by rememberSaveable { mutableStateOf(preferences.getBoolean("reduce_motion", false)) }
+    var idleScenesEnabled by rememberSaveable { mutableStateOf(preferences.getBoolean("idle_scenes", true)) }
+    var previewScene by remember { mutableStateOf<IdleScene?>(null) }
+    val foreground = rememberCompanionForeground()
+    val powerSaving = rememberCompanionPowerSaving()
     var voiceDisclosureAccepted by rememberSaveable { mutableStateOf(false) }
     var showVoiceDisclosure by remember { mutableStateOf(false) }
     var showSubtitle by remember { mutableStateOf(false) }
@@ -106,6 +112,25 @@ fun ConversationScreen(
     val faceOffset = if (faceTrackingState.isCameraActive && faceTrackingState.faceDetected) {
         Offset(faceTrackingState.faceX, faceTrackingState.faceY)
     } else null
+    val sceneConditions = CompanionSceneConditions(
+        foreground = foreground,
+        companionMode = mode == EvaCompanionMode.COMPANION,
+        enabled = idleScenesEnabled,
+        reduceMotion = reduceMotion,
+        powerSaving = powerSaving,
+        processing = state.isProcessing || state.phase != AssistantPhase.IDLE,
+        listening = state.phase == AssistantPhase.LISTENING,
+        speaking = state.voicePlayback.isSpeaking,
+        queuedSpeech = state.voicePlayback.queuedCount > 0,
+        needsAttention = state.pendingAttention,
+        hasNotice = state.notice != null,
+        panelOpen = panel != null || showVoiceDisclosure || showLiveVoiceSheet,
+        editing = state.draft.isNotBlank(),
+        checkingConnection = gatewayStatus.isTesting,
+    )
+    LaunchedEffect(sceneConditions) {
+        if (!sceneConditions.copy(enabled = true).allowsScenes) previewScene = null
+    }
 
     LaunchedEffect(mode) { onCompanionModeChanged(mode) }
     LaunchedEffect(latest?.id, state.voicePlayback.isSpeaking, state.phase) {
@@ -129,11 +154,8 @@ fun ConversationScreen(
     ) {
         val landscape = maxWidth > maxHeight
         val compactInput = landscape && WindowInsets.ime.getBottom(LocalDensity.current) > 0
-        val sceneHeight by animateDpAsState(
-            targetValue = if (state.isProcessing || panel != null) maxHeight * 0.64f else maxHeight * 0.84f,
-            animationSpec = tween(if (reduceMotion) 0 else 280),
-            label = "companion-scene-height",
-        )
+        // Keep the eye anchor fixed when task cards or drawers appear.
+        val sceneHeight = maxHeight * if (landscape) 0.76f else 0.78f
         val panelHeight = maxHeight * if (landscape) 0.94f else 0.86f
         var dragDistance by remember { mutableFloatStateOf(0f) }
 
@@ -168,7 +190,7 @@ fun ConversationScreen(
 
             AssistantAvatar(
                 phase = state.phase,
-                modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(sceneHeight),
+                modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().height(sceneHeight).testTag("assistant-avatar"),
                 diameter = 160.dp,
                 isSpeaking = state.voicePlayback.isSpeaking,
                 faceOffset = faceOffset,
@@ -176,7 +198,14 @@ fun ConversationScreen(
                 companionMode = mode,
                 isLandscape = landscape,
                 micLevel = if (state.phase == AssistantPhase.LISTENING) liveMicLevel else 0f,
-                reduceMotion = reduceMotion,
+                reduceMotion = reduceMotion || powerSaving || !foreground,
+                listeningStage = state.listeningStage,
+                feedback = state.avatarFeedback,
+                voicePlayback = state.voicePlayback,
+                idleScenesAllowed = sceneConditions.allowsScenes,
+                previewScene = previewScene,
+                onPreviewFinished = { previewScene = null },
+                onInteraction = { previewScene = null },
                 onBackgroundTap = openTools,
             )
 
@@ -210,11 +239,11 @@ fun ConversationScreen(
                                                 AssistantPhase.LISTENING,
                                                 isSpeaking = false,
                                                 modifier = Modifier.width(96.dp).height(24.dp),
-                                                micLevel = liveMicLevel,
+                                                micLevel = if (state.listeningStage == ListeningStage.RECOGNIZING || state.listeningStage == ListeningStage.PREPARING) 0f else liveMicLevel,
                                                 reduceMotion = reduceMotion,
                                             )
                                             Spacer(Modifier.width(10.dp))
-                                            Text("正在聆听", color = CompanionAccent, style = MaterialTheme.typography.labelLarge)
+                                            Text(listeningStatusLabel(state.listeningStage), color = CompanionAccent, style = MaterialTheme.typography.labelLarge)
                                         }
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             if (state.draft.isNotBlank()) {
@@ -230,7 +259,11 @@ fun ConversationScreen(
                                         }
                                     }
                                     Text(
-                                        text = if (state.draft.isNotBlank()) "“${state.draft}”" else "请说话，正在实时转译文字…",
+                                        text = if (state.draft.isNotBlank()) "“${state.draft}”" else when (state.listeningStage) {
+                                            ListeningStage.PREPARING -> "麦克风准备好后就可以说话。"
+                                            ListeningStage.RECOGNIZING -> "正在整理刚才听到的话…"
+                                            else -> "请说话，识别文字会显示在这里。"
+                                        },
                                         style = MaterialTheme.typography.bodyLarge,
                                         color = if (state.draft.isNotBlank()) MaterialTheme.colorScheme.onBackground else CompanionMuted,
                                         maxLines = 3,
@@ -246,11 +279,26 @@ fun ConversationScreen(
                         ) {
                             Column(Modifier.padding(16.dp)) {
                                 Text(state.notice, style = MaterialTheme.typography.bodyMedium)
+                                val noticeHasReply = (state.phase == AssistantPhase.COMPLETED || state.phase == AssistantPhase.ERROR) &&
+                                    latest != null && latest.id > (latestUser?.id ?: 0L)
+                                if (noticeHasReply) {
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        latest!!.text,
+                                        modifier = Modifier.clickable { panel = "conversation" },
+                                        maxLines = 3,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                    )
+                                }
                                 if (state.phase == AssistantPhase.ERROR && !state.canRetryTask &&
                                     !state.notice.contains("电脑端确认")) {
                                     Text("请先在电脑端确认状态", color = CompanionMuted, style = MaterialTheme.typography.bodySmall)
                                 }
                                 Row(Modifier.horizontalScroll(rememberScrollState())) {
+                                    if (noticeHasReply) {
+                                        TextButton(onClick = { panel = "conversation" }) { Text("查看回复详情") }
+                                    }
                                     if (state.phase == AssistantPhase.ERROR && latestUser != null && state.canRetryTask) {
                                         TextButton(onClick = { onSubmit(latestUser.text) }) { Text("重试") }
                                     } else if (state.phase == AssistantPhase.ERROR && !state.canRetryTask) {
@@ -346,7 +394,18 @@ fun ConversationScreen(
                                 modeOrdinal = it.ordinal
                                 if (it == EvaCompanionMode.REST) panel = null
                             },
-                            onReduceMotionChanged = { reduceMotion = it },
+                            onReduceMotionChanged = {
+                                reduceMotion = it
+                                preferences.edit().putBoolean("reduce_motion", it).apply()
+                            },
+                            idleScenesEnabled = idleScenesEnabled,
+                            onIdleScenesEnabledChanged = {
+                                idleScenesEnabled = it
+                                preferences.edit().putBoolean("idle_scenes", it).apply()
+                            },
+                            canPreviewScenes = sceneConditions.copy(enabled = true, panelOpen = false).allowsScenes,
+                            powerSaving = powerSaving,
+                            onPreviewScene = { scene -> panel = null; previewScene = scene },
                             gatewayStatus = savedGatewayStatus,
                             onConnection = { panel = "connection" },
                         )
@@ -476,6 +535,9 @@ private fun ToolsPanel(
         "截屏分析" to "分析电脑当前窗口截图",
         "整理当前工作" to "请基于电脑上当前工作内容，梳理今天最重要的三项待办，并说明依据；缺少上下文时先询问我",
         "起草回复" to "请为我正在处理的消息起草回复；先确认消息内容和接收方，只生成草稿，不发送",
+        "指挥 Antigravity 查录音" to "让 Antigravity 查看最近的讯飞录音并简要汇报",
+        "指挥 Antigravity 巡检电脑" to "让 Antigravity 检查电脑当前项目状态并简要汇报",
+        "指挥 WorkBuddy 整理桌面" to "让 WorkBuddy 查看电脑桌面最近的文件并梳理要点",
     )
     Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SourceLabel(state)
@@ -605,6 +667,11 @@ private fun SettingsPanel(
     onSpeechRate: () -> Unit,
     onModeChanged: (EvaCompanionMode) -> Unit,
     onReduceMotionChanged: (Boolean) -> Unit,
+    idleScenesEnabled: Boolean,
+    onIdleScenesEnabledChanged: (Boolean) -> Unit,
+    canPreviewScenes: Boolean,
+    powerSaving: Boolean,
+    onPreviewScene: (IdleScene) -> Unit,
     gatewayStatus: GatewayConnectionStatus,
     onConnection: () -> Unit,
 ) {
@@ -627,7 +694,34 @@ private fun SettingsPanel(
         SettingsAction("播报语速", "${state.voicePlayback.speechRate}x", onSpeechRate)
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
             Text("减少动态效果")
-            Switch(checked = reduceMotion, onCheckedChange = onReduceMotionChanged)
+            Switch(checked = reduceMotion, onCheckedChange = onReduceMotionChanged, modifier = Modifier.testTag("reduce-motion-enabled"))
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Text("待机小剧场", style = MaterialTheme.typography.titleMedium)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("空闲时自动播放")
+            Switch(checked = idleScenesEnabled, onCheckedChange = onIdleScenesEnabledChanged, modifier = Modifier.testTag("idle-scenes-enabled"))
+        }
+        Text(
+            when {
+                powerSaving -> "节电或低电量时暂停小剧场。"
+                reduceMotion -> "减少动态效果已开启，小剧场暂停。"
+                mode != EvaCompanionMode.COMPANION -> "陪伴模式下可播放；勿扰和静息时暂停。"
+                else -> "空闲后偶尔演一个小故事。点击或开始对话会立即打断；场景为本地休闲动画。"
+            },
+            color = CompanionMuted, style = MaterialTheme.typography.bodySmall,
+        )
+        IdleScene.entries.chunked(2).forEach { scenes ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                scenes.forEach { scene ->
+                    OutlinedButton(
+                        onClick = { onPreviewScene(scene) },
+                        enabled = canPreviewScenes,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(14.dp),
+                    ) { Text("预览${scene.label}", maxLines = 1) }
+                }
+            }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Text("陪伴模式", style = MaterialTheme.typography.titleMedium)
@@ -644,6 +738,13 @@ private fun SettingsPanel(
             }
         }
     }
+}
+
+internal fun listeningStatusLabel(stage: ListeningStage): String = when (stage) {
+    ListeningStage.PREPARING -> "正在准备麦克风"
+    ListeningStage.READY -> "请说话"
+    ListeningStage.SPEAKING, ListeningStage.NONE -> "正在聆听"
+    ListeningStage.RECOGNIZING -> "正在识别"
 }
 
 @Composable

@@ -28,6 +28,7 @@ class WorkBuddyBridgeIntegrationTest {
         assertTrue(result.text.contains("未执行真实电脑任务"))
         assertFalse(result.isSample)
         assertEquals(AssistantSource.PC_GATEWAY, result.source)
+        assertEquals(AssistantOutcome.NEEDS_ATTENTION, result.outcome)
         assertEquals("NEEDS_ATTENTION", engine.testConnection(config).errorCode)
     }
 }

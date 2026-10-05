@@ -8,6 +8,9 @@ interface SpeechInputController {
         onFailure: (SpeechInputFailure) -> Unit,
         onPartialResult: (String) -> Unit = {},
         onRmsChanged: (Float) -> Unit = {},
+        onReady: () -> Unit = {},
+        onSpeechBeginning: () -> Unit = {},
+        onSpeechEnd: () -> Unit = {},
     )
 
     fun cancel()

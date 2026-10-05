@@ -3,9 +3,11 @@ package com.evax.mobile.presentation
 import androidx.lifecycle.ViewModelStore
 import com.evax.mobile.domain.AssistantEngine
 import com.evax.mobile.domain.AssistantEvent
+import com.evax.mobile.domain.AssistantOutcome
 import com.evax.mobile.domain.AssistantResult
 import com.evax.mobile.domain.AssistantSource
 import com.evax.mobile.domain.GatewayException
+import com.evax.mobile.domain.ExecutionEvidence
 import com.evax.mobile.domain.SpeechInputFailure
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -283,7 +285,8 @@ class ConversationViewModelTest {
                 delay(100L)
                 emit(AssistantEvent.Progress("提取待办", 2, 3))
                 delay(100L)
-                emit(AssistantEvent.Completed(AssistantResult("完成", "演示数据")))
+                emit(AssistantEvent.Completed(AssistantResult("完成", "演示数据", isSample = true,
+                    source = AssistantSource.LOCAL_DEMO, outcome = AssistantOutcome.TASK_SUCCEEDED)))
             }
         }
         viewModel.submitPrompt("测试任务")
@@ -487,12 +490,250 @@ class ConversationViewModelTest {
             assertFalse(viewModel.uiState.value.isProcessing)
         }
     }
+
+    @Test
+    fun listeningStagesFollowActualCallbacksWithoutRegressingOnLateReady() {
+        val session = viewModel.onListeningStarted()
+        assertEquals(ListeningStage.PREPARING, viewModel.uiState.value.listeningStage)
+        viewModel.onSpeechReady(session)
+        assertEquals(ListeningStage.READY, viewModel.uiState.value.listeningStage)
+        viewModel.onSpeechBeginning(session)
+        assertEquals(ListeningStage.SPEAKING, viewModel.uiState.value.listeningStage)
+        viewModel.onSpeechReady(session)
+        assertEquals(ListeningStage.SPEAKING, viewModel.uiState.value.listeningStage)
+        viewModel.onSpeechEnd(session)
+        viewModel.onSpeechBeginning(session)
+        assertEquals(ListeningStage.RECOGNIZING, viewModel.uiState.value.listeningStage)
+    }
+
+    @Test
+    fun cancelledSpeechCallbacksCannotEditDraftOrSubmitOverNewSession() = runTest(mainDispatcherRule.dispatcher) {
+        val old = viewModel.onListeningStarted()
+        viewModel.onListeningCancelled(old)
+        val current = viewModel.onListeningStarted()
+        viewModel.onSpeechPartialResult("当前文字", current)
+        viewModel.onSpeechReady(old)
+        viewModel.onSpeechPartialResult("旧文字", old)
+        viewModel.onSpeechResult("旧指令", old)
+        viewModel.onSpeechFailure(SpeechInputFailure.PERMISSION_DENIED, old)
+        viewModel.onListeningCancelled(old)
+        runCurrent()
+        assertEquals(ListeningStage.PREPARING, viewModel.uiState.value.listeningStage)
+        assertEquals("当前文字", viewModel.uiState.value.draft)
+        assertTrue(engine.prompts.isEmpty())
+        assertEquals(null, viewModel.uiState.value.notice)
+    }
+
+    @Test
+    fun recognizedFinalInvalidatesDuplicateResultAndPartialCallbacks() = runTest(mainDispatcherRule.dispatcher) {
+        val session = viewModel.onListeningStarted()
+        viewModel.onSpeechEnd(session)
+        viewModel.onSpeechResult("整理会议纪要", session)
+        runCurrent()
+        val state = viewModel.uiState.value
+        viewModel.onSpeechResult("重复指令", session)
+        viewModel.onSpeechPartialResult("迟到文字", session)
+        viewModel.onSpeechFailure(SpeechInputFailure.NO_MATCH, session)
+        assertEquals(listOf("整理会议纪要"), engine.prompts)
+        assertEquals(state, viewModel.uiState.value)
+        assertEquals(ListeningStage.NONE, state.listeningStage)
+    }
+
+    @Test
+    fun noMatchAndPermissionFailureHaveDifferentFeedback() {
+        val first = viewModel.onListeningStarted()
+        viewModel.onSpeechFailure(SpeechInputFailure.NO_MATCH, first)
+        assertEquals(AvatarFeedbackKind.SPEECH_NOT_UNDERSTOOD, viewModel.uiState.value.avatarFeedback?.kind)
+        assertEquals(ListeningStage.NONE, viewModel.uiState.value.listeningStage)
+        val second = viewModel.onListeningStarted()
+        viewModel.onSpeechFailure(SpeechInputFailure.PERMISSION_DENIED, second)
+        assertEquals(AvatarFeedbackKind.FAILED, viewModel.uiState.value.avatarFeedback?.kind)
+        assertTrue(viewModel.uiState.value.notice.orEmpty().contains("麦克风权限"))
+    }
+
+    @Test
+    fun plainComputerReplyDoesNotClaimTaskSuccessOrCompleteCurrentStep() = runTest(mainDispatcherRule.dispatcher) {
+        engine.response = { flowOf(
+            AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "电脑网关"),
+            AssistantEvent.Progress("已提交电脑", 1, 2),
+            AssistantEvent.Completed(AssistantResult("我已经完成了任务", "官方回复", source = AssistantSource.PC_GATEWAY)),
+        ) }
+        viewModel.submitPrompt("处理文档")
+        runCurrent()
+        assertEquals(AvatarFeedbackKind.REPLY_READY, viewModel.uiState.value.avatarFeedback?.kind)
+        assertTrue(viewModel.uiState.value.completedProgressSteps.isEmpty())
+        assertFalse(viewModel.uiState.value.messages.last().isSample)
+    }
+
+    @Test
+    fun taskSuccessRequiresMatchingBoundIdsAndVerifiedTerminalEvidence() = runTest(mainDispatcherRule.dispatcher) {
+        val valid = AssistantResult("任务已确认完成", "官方回复", source = AssistantSource.PC_GATEWAY,
+            outcome = AssistantOutcome.TASK_SUCCEEDED, requestId = "request-1", taskId = "run-1",
+            evidence = ExecutionEvidence("codebuddy_run_stream", "completed", verified = true, terminal = true))
+        for (result in listOf(valid, valid.copy(evidence = null), valid.copy(evidence = valid.evidence?.copy(terminal = false)),
+            valid.copy(requestId = null), valid.copy(taskId = null), valid.copy(isSample = true),
+            valid.copy(evidence = valid.evidence?.copy(source = "workbuddy_message")))) {
+            engine.response = { flowOf(
+                AssistantEvent.SourceChanged(AssistantSource.PC_GATEWAY, "电脑网关"),
+                AssistantEvent.RequestStarted("request-1"),
+                AssistantEvent.Progress("电脑已接收", 1, 2, "run-1", "request-1"),
+                AssistantEvent.Completed(result),
+            ) }
+            viewModel.submitPrompt("处理文档")
+            runCurrent()
+            assertEquals(if (result == valid) AvatarFeedbackKind.TASK_SUCCEEDED else AvatarFeedbackKind.UNCERTAIN,
+                viewModel.uiState.value.avatarFeedback?.kind)
+        }
+    }
+
+    @Test
+    fun localDemoCannotDropSampleFlagOrClaimComputerTaskSuccess() = runTest(mainDispatcherRule.dispatcher) {
+        engine.response = { flowOf(AssistantEvent.Completed(AssistantResult("本地样例", "错误的官方标签",
+            isSample = false, source = AssistantSource.LOCAL_DEMO, outcome = AssistantOutcome.TASK_SUCCEEDED))) }
+        viewModel.submitPrompt("演示")
+        runCurrent()
+        assertEquals(AvatarFeedbackKind.DEMO_SUCCEEDED, viewModel.uiState.value.avatarFeedback?.kind)
+        assertTrue(viewModel.uiState.value.messages.last().isSample)
+        assertEquals("演示数据", viewModel.uiState.value.messages.last().sampleLabel)
+    }
+
+    @Test
+    fun stoppingLocalDemoDoesNotClaimUncertainComputerOperation() = runTest(mainDispatcherRule.dispatcher) {
+        engine.response = { flow {
+            emit(AssistantEvent.SourceChanged(AssistantSource.LOCAL_DEMO, "本地演示"))
+            awaitCancellation()
+        } }
+        viewModel.submitPrompt("演示")
+        runCurrent()
+        viewModel.cancelProcessing()
+        assertEquals(AvatarFeedbackKind.CANCELLED, viewModel.uiState.value.avatarFeedback?.kind)
+        assertFalse(viewModel.uiState.value.pendingAttention)
+        assertEquals("已停止本地演示。", viewModel.uiState.value.notice)
+    }
+
+    @Test
+    fun mismatchedTaskCannotAppendForeignReplyOrSpeak() = runTest(mainDispatcherRule.dispatcher) {
+        val spoken = mutableListOf<String>()
+        viewModel.setSpeechCallback { text, _ -> spoken += text }
+        engine.response = { flowOf(
+            AssistantEvent.RequestStarted("current-request"),
+            AssistantEvent.Progress("电脑已接收", 1, 2, "current-run", "current-request"),
+            AssistantEvent.Completed(AssistantResult("别的任务结果", "官方回复", source = AssistantSource.PC_GATEWAY,
+                outcome = AssistantOutcome.TASK_SUCCEEDED, requestId = "current-request", taskId = "old-run",
+                evidence = ExecutionEvidence("codebuddy_run_stream", "completed", true, true))),
+        ) }
+        viewModel.submitPrompt("当前任务")
+        runCurrent()
+        assertEquals(listOf("当前任务"), viewModel.uiState.value.messages.map { it.text })
+        assertEquals(AvatarFeedbackKind.UNCERTAIN, viewModel.uiState.value.avatarFeedback?.kind)
+        assertTrue(spoken.isEmpty())
+    }
+
+    @Test
+    fun duplicateCompletionCannotAppendSpeakOrTriggerFeedbackAgain() = runTest(mainDispatcherRule.dispatcher) {
+        val spoken = mutableListOf<String>()
+        viewModel.setSpeechCallback { text, _ -> spoken += text }
+        val event = AssistantEvent.Completed(AssistantResult("一份回复", "官方回复", source = AssistantSource.PC_GATEWAY))
+        engine.response = { flowOf(event, event, AssistantEvent.SpeakSentence("迟到句子", false)) }
+        viewModel.submitPrompt("当前任务")
+        runCurrent()
+        assertEquals(listOf("当前任务", "一份回复"), viewModel.uiState.value.messages.map { it.text })
+        assertEquals(listOf("一份回复"), spoken)
+        assertEquals(1L, viewModel.uiState.value.avatarFeedback?.eventId)
+    }
+
+    @Test
+    fun pendingFailedUncertainAndLocalStopHaveDistinctFeedback() = runTest(mainDispatcherRule.dispatcher) {
+        for ((outcome, kind) in listOf(
+            AssistantOutcome.NEEDS_ATTENTION to AvatarFeedbackKind.NEEDS_ATTENTION,
+            AssistantOutcome.FAILED to AvatarFeedbackKind.FAILED,
+            AssistantOutcome.UNCERTAIN to AvatarFeedbackKind.UNCERTAIN,
+        )) {
+            engine.response = { flowOf(AssistantEvent.Completed(AssistantResult("状态说明", "官方回复",
+                source = AssistantSource.PC_GATEWAY, outcome = outcome))) }
+            viewModel.submitPrompt("检查")
+            runCurrent()
+            assertEquals(kind, viewModel.uiState.value.avatarFeedback?.kind)
+            assertEquals(outcome != AssistantOutcome.FAILED, viewModel.uiState.value.pendingAttention)
+            assertEquals("状态说明", viewModel.uiState.value.messages.last().text)
+        }
+        engine.response = { flow { awaitCancellation() } }
+        viewModel.submitPrompt("电脑任务")
+        runCurrent()
+        viewModel.cancelProcessing()
+        assertEquals(AvatarFeedbackKind.UNCERTAIN, viewModel.uiState.value.avatarFeedback?.kind)
+        assertTrue(viewModel.uiState.value.pendingAttention)
+    }
+
+    @Test
+    fun ttsDoneAndErrorCannotChangeReplyIntoTaskSuccess() = runTest(mainDispatcherRule.dispatcher) {
+        engine.response = { flowOf(AssistantEvent.Completed(AssistantResult("普通回复", "官方回复", source = AssistantSource.PC_GATEWAY))) }
+        viewModel.submitPrompt("检查")
+        runCurrent()
+        val feedback = viewModel.uiState.value.avatarFeedback
+        viewModel.onVoicePlaybackChanged(VoicePlaybackState(playbackEvent = VoicePlaybackEvent.DONE, eventSequence = 1))
+        assertEquals(feedback, viewModel.uiState.value.avatarFeedback)
+        viewModel.onVoicePlaybackChanged(VoicePlaybackState(playbackEvent = VoicePlaybackEvent.ERROR, eventSequence = 2, errorCode = -1))
+        assertEquals(feedback, viewModel.uiState.value.avatarFeedback)
+        assertTrue(viewModel.uiState.value.notice.orEmpty().contains("语音播放失败"))
+    }
+
+    @Test
+    fun dismissingPendingTaskUncertainResultOrAttentionErrorPreservesPendingAndRetryGuard() = runTest(mainDispatcherRule.dispatcher) {
+        for (response in listOf<(String) -> Flow<AssistantEvent>>(
+            { flowOf(AssistantEvent.Completed(AssistantResult("电脑回复待确认", "官方回复",
+                source = AssistantSource.PC_GATEWAY, outcome = AssistantOutcome.NEEDS_ATTENTION))) },
+            { flowOf(AssistantEvent.Completed(AssistantResult("电脑终态未知", "官方回复",
+                source = AssistantSource.PC_GATEWAY, outcome = AssistantOutcome.UNCERTAIN))) },
+            { flow { throw GatewayException("NEEDS_ATTENTION", "先确认电脑状态") } },
+        )) {
+            engine.response = response
+            viewModel.submitPrompt("检查")
+            runCurrent()
+            assertTrue(viewModel.uiState.value.pendingAttention)
+            assertFalse(viewModel.uiState.value.canRetryTask)
+            val feedback = viewModel.uiState.value.avatarFeedback
+            viewModel.clearNotice()
+            assertEquals(null, viewModel.uiState.value.notice)
+            assertTrue(viewModel.uiState.value.pendingAttention)
+            assertFalse(viewModel.uiState.value.canRetryTask)
+            assertEquals(feedback, viewModel.uiState.value.avatarFeedback)
+        }
+    }
+
+    @Test
+    fun dismissingLocalStopOfComputerReceptionDoesNotConfirmRemoteCancellation() = runTest(mainDispatcherRule.dispatcher) {
+        engine.response = { flow { awaitCancellation() } }
+        viewModel.submitPrompt("电脑任务")
+        runCurrent()
+        viewModel.cancelProcessing()
+        viewModel.clearNotice()
+        assertTrue(viewModel.uiState.value.pendingAttention)
+        assertFalse(viewModel.uiState.value.canRetryTask)
+        assertEquals(AvatarFeedbackKind.UNCERTAIN, viewModel.uiState.value.avatarFeedback?.kind)
+    }
+
+    @Test
+    fun dismissingKnownPreflightFailureReturnsToIdleWithoutPendingAttention() = runTest(mainDispatcherRule.dispatcher) {
+        engine.response = { flow { throw GatewayException("offline", "电脑离线，未提交任务") } }
+        viewModel.submitPrompt("检查")
+        runCurrent()
+        assertEquals(AvatarFeedbackKind.FAILED, viewModel.uiState.value.avatarFeedback?.kind)
+        assertFalse(viewModel.uiState.value.pendingAttention)
+        val retryBefore = viewModel.uiState.value.canRetryTask
+        viewModel.clearNotice()
+        assertEquals(AssistantPhase.IDLE, viewModel.uiState.value.phase)
+        assertEquals(null, viewModel.uiState.value.notice)
+        assertFalse(viewModel.uiState.value.pendingAttention)
+        assertEquals(retryBefore, viewModel.uiState.value.canRetryTask)
+    }
 }
 
 private class RecordingAssistantEngine : AssistantEngine {
     val prompts = mutableListOf<String>()
     var response: (String) -> Flow<AssistantEvent> = {
-        flowOf(AssistantEvent.Completed(AssistantResult("演示回复", "演示数据", isSample = true)))
+        flowOf(AssistantEvent.Completed(AssistantResult("演示回复", "演示数据", isSample = true,
+            source = AssistantSource.LOCAL_DEMO, outcome = AssistantOutcome.TASK_SUCCEEDED)))
     }
 
     override fun respond(prompt: String): Flow<AssistantEvent> {

@@ -34,6 +34,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                     followUps = listOf(
                         "确认各项待办的负责人",
                         "补充每项任务的完成时间",
@@ -52,6 +53,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                 ),
             ),
         )
@@ -69,6 +71,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                     followUps = listOf(
                         "一键生成当前代码变更摘要",
                         "将屏幕选中内容发送至知识库",
@@ -90,6 +93,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                     followUps = listOf(
                         "查看最近一次 Agent 执行日志",
                         "唤醒电脑端 WorkBuddy 协同任务",
@@ -112,6 +116,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                     followUps = listOf(
                         "确认立即发送该钉钉消息",
                         "同时在日历中添加跟进提醒",
@@ -134,6 +139,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                     followUps = listOf(
                         "在电脑端打开并预览文档",
                         "一键转发至项目群讨论",
@@ -155,6 +161,7 @@ class DemoAssistantEngine(
                     sampleLabel = SAMPLE_LABEL,
                     isSample = true,
                     source = AssistantSource.LOCAL_DEMO,
+                    outcome = AssistantOutcome.TASK_SUCCEEDED,
                     followUps = listOf(
                         "试试说：今天下午有什么安排",
                         "试试说：帮我整理刚才的会议纪要",

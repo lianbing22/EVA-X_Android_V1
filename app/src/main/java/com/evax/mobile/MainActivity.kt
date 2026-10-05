@@ -100,9 +100,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var cameraFaceTracker: CameraFaceTracker
     private var cameraTrackingEnabled = false
     private var companionMode = EvaCompanionMode.COMPANION
+    private var systemSpeechSessionId: Long? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        systemSpeechSessionId = savedInstanceState?.getLong("systemSpeechSessionId", -1L)?.takeIf { it > 0L }
         cameraTrackingEnabled = savedInstanceState?.getBoolean("cameraTrackingEnabled") ?: false
         companionMode = savedInstanceState?.getString("companionMode")
             ?.let { value -> EvaCompanionMode.entries.firstOrNull { it.name == value } }
@@ -152,18 +154,20 @@ class MainActivity : ComponentActivity() {
                 val systemSpeechLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult(),
                 ) { result ->
-                    if (result.resultCode == Activity.RESULT_OK) {
+                    val sessionId = systemSpeechSessionId
+                    systemSpeechSessionId = null
+                    if (sessionId != null && result.resultCode == Activity.RESULT_OK) {
                         val recognized = result.data
                             ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
                             ?.firstOrNull { it.isNotBlank() }
                             .orEmpty()
                         if (recognized.isNotBlank()) {
-                            conversationViewModel.onSpeechResult(recognized)
+                            conversationViewModel.onSpeechResult(recognized, sessionId)
                         } else {
-                            conversationViewModel.onSpeechFailure(SpeechInputFailure.NO_MATCH)
+                            conversationViewModel.onSpeechFailure(SpeechInputFailure.NO_MATCH, sessionId)
                         }
-                    } else {
-                        conversationViewModel.onListeningCancelled()
+                    } else if (sessionId != null) {
+                        conversationViewModel.onListeningCancelled(sessionId)
                     }
                 }
 
@@ -214,6 +218,8 @@ class MainActivity : ComponentActivity() {
                     onDraftChanged = conversationViewModel::onDraftChanged,
                     onSubmit = { prompt ->
                         speechInputController.cancel()
+                        speechOutputController.stop()
+                        systemSpeechSessionId = null
                         liveMicLevel = 0f
                         conversationViewModel.submitPrompt(prompt)
                     },
@@ -280,6 +286,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onStopListening = {
                         speechInputController.cancel()
+                        systemSpeechSessionId = null
                         showLiveVoiceSheet = false
                         liveMicLevel = 0f
                         conversationViewModel.onListeningCancelled()
@@ -291,6 +298,7 @@ class MainActivity : ComponentActivity() {
                         if (mode != EvaCompanionMode.COMPANION) speechOutputController.stop()
                         if (mode == EvaCompanionMode.REST) {
                             speechInputController.cancel()
+                            systemSpeechSessionId = null
                             conversationViewModel.onListeningCancelled()
                             if (uiState.isProcessing) conversationViewModel.cancelProcessing()
                             liveMicLevel = 0f
@@ -323,7 +331,8 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         if (::speechInputController.isInitialized) {
             speechInputController.cancel()
-            conversationViewModel.onListeningCancelled()
+            // The system recognition activity temporarily owns the foreground.
+            if (systemSpeechSessionId == null) conversationViewModel.onListeningCancelled()
         }
         if (::speechOutputController.isInitialized) speechOutputController.stop()
         if (::cameraFaceTracker.isInitialized) cameraFaceTracker.stop()
@@ -333,6 +342,7 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("cameraTrackingEnabled", cameraTrackingEnabled)
         outState.putString("companionMode", companionMode.name)
+        systemSpeechSessionId?.let { outState.putLong("systemSpeechSessionId", it) }
         super.onSaveInstanceState(outState)
     }
 
@@ -349,32 +359,45 @@ class MainActivity : ComponentActivity() {
         onUpdateMicLevel: (Float) -> Unit,
         onOpenLiveSheetFallback: () -> Unit,
     ) {
+        if (conversationViewModel.uiState.value.isProcessing) return
         if (::speechOutputController.isInitialized) {
             speechOutputController.stop()
         }
         onUpdateMicLevel(0f)
         conversationViewModel.onDraftChanged("")
-        conversationViewModel.onListeningStarted()
+        val sessionId = conversationViewModel.onListeningStarted()
+        systemSpeechSessionId = null
         speechInputController.start(
-            onResult = { text -> onUpdateMicLevel(0f); conversationViewModel.onSpeechResult(text) },
+            onResult = { text ->
+                if (isSpeechSessionActive(sessionId)) onUpdateMicLevel(0f)
+                conversationViewModel.onSpeechResult(text, sessionId)
+            },
             onPartialResult = { partial ->
                 if (partial.isNotBlank()) {
-                    conversationViewModel.onDraftChanged(partial)
+                    conversationViewModel.onSpeechPartialResult(partial, sessionId)
                 }
             },
             onRmsChanged = { rmsdB ->
                 val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
-                onUpdateMicLevel(normalized)
+                if (isSpeechSessionActive(sessionId)) onUpdateMicLevel(normalized)
+            },
+            onReady = { conversationViewModel.onSpeechReady(sessionId) },
+            onSpeechBeginning = { conversationViewModel.onSpeechBeginning(sessionId) },
+            onSpeechEnd = {
+                if (isSpeechSessionActive(sessionId)) onUpdateMicLevel(0f)
+                conversationViewModel.onSpeechEnd(sessionId)
             },
             onFailure = { failure ->
-                onUpdateMicLevel(0f)
-                if (failure == SpeechInputFailure.SERVICE_UNAVAILABLE || failure == SpeechInputFailure.UNKNOWN) {
-                    if (!tryLaunchSystemSpeechDialog(systemSpeechLauncher)) {
-                        conversationViewModel.onListeningCancelled()
-                        onOpenLiveSheetFallback()
+                if (isSpeechSessionActive(sessionId)) {
+                    onUpdateMicLevel(0f)
+                    if (failure == SpeechInputFailure.SERVICE_UNAVAILABLE || failure == SpeechInputFailure.UNKNOWN) {
+                        if (!tryLaunchSystemSpeechDialog(systemSpeechLauncher, sessionId)) {
+                            conversationViewModel.onListeningCancelled(sessionId)
+                            onOpenLiveSheetFallback()
+                        }
+                    } else {
+                        conversationViewModel.onSpeechFailure(failure, sessionId)
                     }
-                } else {
-                    conversationViewModel.onSpeechFailure(failure)
                 }
             },
         )
@@ -382,6 +405,7 @@ class MainActivity : ComponentActivity() {
 
     private fun tryLaunchSystemSpeechDialog(
         launcher: ActivityResultLauncher<Intent>,
+        sessionId: Long,
     ): Boolean {
         return try {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -392,15 +416,22 @@ class MainActivity : ComponentActivity() {
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             }
             if (intent.resolveActivity(packageManager) != null) {
+                systemSpeechSessionId = sessionId
                 launcher.launch(intent)
                 true
             } else {
                 false
             }
         } catch (_: Throwable) {
+            systemSpeechSessionId = null
             false
         }
     }
+
+    private fun isSpeechSessionActive(sessionId: Long): Boolean =
+        conversationViewModel.uiState.value.let {
+            it.listeningSessionId == sessionId && it.phase == com.evax.mobile.presentation.AssistantPhase.LISTENING
+        }
 
     private fun speakAssistantSentence(sentence: String, isFirst: Boolean) {
         if (::speechOutputController.isInitialized && companionMode == EvaCompanionMode.COMPANION &&

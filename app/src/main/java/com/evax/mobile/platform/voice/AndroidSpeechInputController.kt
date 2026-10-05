@@ -37,6 +37,9 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
         onFailure: (SpeechInputFailure) -> Unit,
         onPartialResult: (String) -> Unit,
         onRmsChanged: (Float) -> Unit,
+        onReady: () -> Unit,
+        onSpeechBeginning: () -> Unit,
+        onSpeechEnd: () -> Unit,
     ) {
         onMain {
             if (destroyed) {
@@ -58,6 +61,9 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
                 onFailure = onFailure,
                 onPartialResult = onPartialResult,
                 onRmsChanged = onRmsChanged,
+                onReady = onReady,
+                onSpeechBeginning = onSpeechBeginning,
+                onSpeechEnd = onSpeechEnd,
             )
         }
     }
@@ -94,6 +100,9 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
         onFailure: (SpeechInputFailure) -> Unit,
         onPartialResult: (String) -> Unit,
         onRmsChanged: (Float) -> Unit,
+        onReady: () -> Unit,
+        onSpeechBeginning: () -> Unit,
+        onSpeechEnd: () -> Unit,
     ) {
         if (destroyed || index >= candidates.size) {
             onFailure(SpeechInputFailure.SERVICE_UNAVAILABLE)
@@ -108,7 +117,7 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
                 SpeechRecognizer.createSpeechRecognizer(appContext, component)
             }
         } catch (_: Throwable) {
-            tryStartCandidate(candidates, index + 1, onResult, onFailure, onPartialResult, onRmsChanged)
+            tryStartCandidate(candidates, index + 1, onResult, onFailure, onPartialResult, onRmsChanged, onReady, onSpeechBeginning, onSpeechEnd)
             return
         }
 
@@ -117,29 +126,33 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
         recognizer = instance
         activeDelivery = delivery
 
+        fun isActive(): Boolean = !destroyed && recognizer === instance && activeDelivery === delivery && !delivery.get()
+
         fun fallbackOrFail(failure: SpeechInputFailure) {
+            if (!isActive() || !delivery.compareAndSet(false, true)) return
             release(instance, delivery)
             if (index + 1 < candidates.size &&
                 (failure == SpeechInputFailure.SERVICE_UNAVAILABLE || failure == SpeechInputFailure.UNKNOWN)
             ) {
-                tryStartCandidate(candidates, index + 1, onResult, onFailure, onPartialResult, onRmsChanged)
-            } else if (delivery.compareAndSet(false, true)) {
+                tryStartCandidate(candidates, index + 1, onResult, onFailure, onPartialResult, onRmsChanged, onReady, onSpeechBeginning, onSpeechEnd)
+            } else {
                 onFailure(failure)
             }
         }
 
         instance.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) = Unit
-            override fun onBeginningOfSpeech() = Unit
+            override fun onReadyForSpeech(params: Bundle?) { if (isActive()) onReady() }
+            override fun onBeginningOfSpeech() { if (isActive()) onSpeechBeginning() }
             override fun onRmsChanged(rmsdB: Float) {
-                onRmsChanged(rmsdB)
+                if (isActive()) onRmsChanged(rmsdB)
             }
 
             override fun onBufferReceived(buffer: ByteArray?) = Unit
-            override fun onEndOfSpeech() = Unit
+            override fun onEndOfSpeech() { if (isActive()) onSpeechEnd() }
             override fun onEvent(eventType: Int, params: Bundle?) = Unit
 
             override fun onPartialResults(partialResults: Bundle?) {
+                if (!isActive()) return
                 val stable = partialResults
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull { it.isNotBlank() }
@@ -153,33 +166,25 @@ class AndroidSpeechInputController(context: Context) : SpeechInputController {
                     stable.isNotBlank() -> stable
                     else -> unstable
                 }.trim()
-                if (combined.isNotBlank()) {
+                if (combined.isNotBlank() && combined != lastPartialText) {
                     lastPartialText = combined
                     onPartialResult(combined)
                 }
             }
 
             override fun onError(error: Int) {
-                // If partial results already captured real speech before end-of-speech timeout/no-match, deliver it!
-                if (lastPartialText.isNotBlank() &&
-                    (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
-                ) {
-                    if (delivery.compareAndSet(false, true)) {
-                        onResult(lastPartialText)
-                    }
-                    release(instance, delivery)
-                    return
-                }
+                if (!isActive()) return
+                // partial 只用于回显，识别失败不能把半句文字当最终指令提交给电脑。
                 fallbackOrFail(SpeechErrorMapper.map(error))
             }
 
             override fun onResults(results: Bundle?) {
+                if (!isActive()) return
                 if (!delivery.compareAndSet(false, true)) return
                 val recognizedText = results
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull { it.isNotBlank() }
-                    ?.ifBlank { lastPartialText }
-                    ?: lastPartialText
+                    .orEmpty()
 
                 if (recognizedText.isBlank()) {
                     onFailure(SpeechInputFailure.NO_MATCH)

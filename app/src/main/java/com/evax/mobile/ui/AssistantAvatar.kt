@@ -7,11 +7,17 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -20,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -34,11 +41,17 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.evax.mobile.presentation.AssistantPhase
+import com.evax.mobile.presentation.AvatarFeedback
+import com.evax.mobile.presentation.AvatarFeedbackKind
+import com.evax.mobile.presentation.ListeningStage
+import com.evax.mobile.presentation.VoicePlaybackEvent
+import com.evax.mobile.presentation.VoicePlaybackState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlin.math.abs
@@ -72,10 +85,21 @@ fun AssistantAvatar(
     micLevel: Float = 0f,
     reduceMotion: Boolean = false,
     onBackgroundTap: (() -> Unit)? = null,
+    listeningStage: ListeningStage = ListeningStage.NONE,
+    feedback: AvatarFeedback? = null,
+    idleScenesAllowed: Boolean = false,
+    previewScene: IdleScene? = null,
+    onPreviewFinished: () -> Unit = {},
+    onInteraction: () -> Unit = {},
+    voicePlayback: VoicePlaybackState = VoicePlaybackState(),
 ) {
+    val scope = rememberCoroutineScope()
+    val player = remember(scope) { AvatarBehaviorPlayer(scope) }
+    val scheduler = remember { IdleSceneScheduler() }
+    val eventGate = remember { AvatarEventGate() }
+    val backchannelGate = remember { ListeningBackchannelGate() }
     val blink = remember { Animatable(1f) }
     val wink = remember { Animatable(1f) }
-    val errorShake = remember { Animatable(0f) }
     val scan = remember { Animatable(0f) }
     var idleGaze by remember { mutableStateOf(Offset.Zero) }
     var idleTilt by remember { mutableStateOf(0f) }
@@ -83,220 +107,276 @@ fun AssistantAvatar(
     var tapSerial by remember { mutableIntStateOf(0) }
     var winkSerial by remember { mutableIntStateOf(0) }
     var handledWinkSerial by remember { mutableIntStateOf(0) }
-    var completionSmile by remember { mutableStateOf(false) }
+    var previousPhase by remember { mutableStateOf(phase) }
     val companionActive = companionMode == EvaCompanionMode.COMPANION
+    val resting = companionMode == EvaCompanionMode.REST
     val idle = phase == AssistantPhase.IDLE || phase == AssistantPhase.COMPLETED
-    val taskExpressionActive = companionMode != EvaCompanionMode.REST &&
-        (companionActive || phase != AssistantPhase.IDLE)
+    val audioBusy = isSpeaking || voicePlayback.isSpeaking || voicePlayback.queuedCount > 0
+    val sceneEligible = idleScenesAllowed && companionActive && phase == AssistantPhase.IDLE &&
+        listeningStage == ListeningStage.NONE && !audioBusy && !reduceMotion && feedback?.kind != AvatarFeedbackKind.NEEDS_ATTENTION
+    val previewEligible = companionActive && idle && listeningStage == ListeningStage.NONE && !audioBusy && !reduceMotion &&
+        feedback?.kind != AvatarFeedbackKind.NEEDS_ATTENTION
+    val previewFinishedGate = remember(previewScene) { AvatarEventGate() }
+    val currentPreview by rememberUpdatedState(previewScene)
+    val currentPreviewFinished by rememberUpdatedState(onPreviewFinished)
+    val currentInteraction by rememberUpdatedState(onInteraction)
+    val currentBackgroundTap by rememberUpdatedState(onBackgroundTap)
 
-    // Pauses between gestures prevent the perpetual rocking of a looping demo animation.
-    LaunchedEffect(phase, companionMode, reduceMotion) {
-        idleGaze = Offset.Zero
-        idleTilt = 0f
-        if (!companionActive || !idle || reduceMotion) return@LaunchedEffect
-        while (isActive) {
-            delay(Random.nextLong(1_800L, 5_001L))
-            idleGaze = if (Random.nextFloat() < 0.35f) {
-                Offset.Zero
-            } else {
-                Offset(Random.nextFloat() * 0.72f - 0.36f, Random.nextFloat() * 0.24f - 0.12f)
-            }
-            idleTilt = if (Random.nextFloat() < 0.18f) Random.nextFloat() * 5f - 2.5f else 0f
+    DisposableEffect(player) { onDispose { player.cancel() } }
+
+    // Real state changes and touches take control before a lower-priority script can publish.
+    LaunchedEffect(phase, companionMode, reduceMotion, listeningStage, tapSerial) {
+        val oldPhase = previousPhase
+        previousPhase = phase
+        player.cancel()
+        scheduler.interrupt(System.nanoTime() / 1_000_000L)
+        if (!resting && !reduceMotion && phase == AssistantPhase.THINKING && oldPhase == AssistantPhase.LISTENING) {
+            player.play(recognitionAcceptedScript(), requestedPriority = 3)
+        } else if (!resting && !reduceMotion && feedback == null && phase == AssistantPhase.COMPLETED && oldPhase != phase) {
+            // Older callers can express a ready reply, but cannot assert execution success.
+            player.play(feedbackScript(AvatarFeedbackKind.REPLY_READY), requestedPriority = 3)
         }
     }
 
-    LaunchedEffect(phase, companionMode, reduceMotion) {
+    LaunchedEffect(feedback?.eventId, feedback?.kind) {
+        val event = feedback ?: return@LaunchedEffect
+        if (!eventGate.consume("feedback", event.eventId) || resting || reduceMotion) return@LaunchedEffect
+        player.play(feedbackScript(event.kind), requestedPriority = 3)
+    }
+
+    // Playback callbacks provide sentence beats, never measured output audio or task success.
+    LaunchedEffect(voicePlayback.eventSequence) {
+        if (!eventGate.consume("tts", voicePlayback.eventSequence) || resting || reduceMotion || phase == AssistantPhase.LISTENING) return@LaunchedEffect
+        when (voicePlayback.playbackEvent) {
+            VoicePlaybackEvent.STARTED -> { player.cancelScene(); player.play(speechBeatScript(true), requestedPriority = 1) }
+            VoicePlaybackEvent.DONE -> player.play(speechBeatScript(false), requestedPriority = 1)
+            VoicePlaybackEvent.ERROR, VoicePlaybackEvent.STOPPED -> player.cancelScene()
+            VoicePlaybackEvent.NONE -> Unit
+        }
+    }
+
+    // The same cancellable loop services automatic scenes and a single explicit preview.
+    LaunchedEffect(sceneEligible, previewScene, previewEligible, tapSerial) {
+        val now = System.nanoTime() / 1_000_000L
+        scheduler.setEligible(sceneEligible, now)
+        player.cancelScene()
+        val requestedPreview = previewScene
+        if (requestedPreview != null) {
+            var previewJob: kotlinx.coroutines.Job? = null
+            try {
+                if (previewEligible) {
+                    val run = scheduler.beginPreview(requestedPreview)
+                    previewJob = player.play(idleSceneScript(run.scene), run.scene)
+                    previewJob?.join()
+                    scheduler.finish(run.token, System.nanoTime() / 1_000_000L)
+                }
+            } finally {
+                player.cancelRun(previewJob)
+                if (currentPreview == requestedPreview && previewFinishedGate.consume("preview", 0L)) currentPreviewFinished()
+            }
+            return@LaunchedEffect
+        }
+        if (!sceneEligible) return@LaunchedEffect
+        while (isActive) {
+            val deadline = scheduler.nextAtMillis ?: break
+            delay((deadline - System.nanoTime() / 1_000_000L).coerceAtLeast(1L))
+            val run = scheduler.poll(System.nanoTime() / 1_000_000L) ?: continue
+            val sceneJob = player.play(idleSceneScript(run.scene), run.scene)
+            try {
+                sceneJob?.join()
+            } finally {
+                scheduler.finish(run.token, System.nanoTime() / 1_000_000L)
+                player.cancelRun(sceneJob)
+            }
+        }
+    }
+
+    val autonomousGaze = companionActive && idle && !reduceMotion && !audioBusy && player.frame == null && touchGaze == null
+    LaunchedEffect(autonomousGaze) {
+        idleGaze = Offset.Zero
+        idleTilt = 0f
+        if (!autonomousGaze) return@LaunchedEffect
+        while (isActive) {
+            delay(Random.nextLong(1_800L, 5_001L))
+            idleGaze = if (Random.nextFloat() < 0.35f) Offset.Zero else
+                Offset(Random.nextFloat() * 0.84f - 0.42f, Random.nextFloat() * 0.30f - 0.15f)
+            idleTilt = if (Random.nextFloat() < 0.18f) Random.nextFloat() * 6f - 3f else 0f
+        }
+    }
+
+    // Phase and scene changes deliberately do not reset the natural blink clock.
+    LaunchedEffect(companionActive, reduceMotion) {
         blink.snapTo(1f)
         if (!companionActive || reduceMotion) return@LaunchedEffect
         while (isActive) {
             delay(Random.nextLong(2_500L, 6_501L))
-            blink.animateTo(0.06f, tween(75, easing = FastOutSlowInEasing))
-            blink.animateTo(1f, tween(135, easing = FastOutSlowInEasing))
-            if (Random.nextFloat() < 0.1f) {
+            blink.animateTo(0.06f, tween(65, easing = FastOutSlowInEasing))
+            blink.animateTo(1f, tween(125, easing = FastOutSlowInEasing))
+            if (Random.nextFloat() < 0.10f) {
                 delay(120)
-                blink.animateTo(0.06f, tween(70))
-                blink.animateTo(1f, tween(130))
+                blink.animateTo(0.06f, tween(65))
+                blink.animateTo(1f, tween(120))
             }
         }
     }
 
-    LaunchedEffect(tapSerial, companionMode) {
+    LaunchedEffect(touchGaze, companionMode) {
         if (!companionActive) touchGaze = null
-        if (tapSerial > 0 && touchGaze != null) {
-            delay(2_000)
-            touchGaze = null
-        }
+        if (touchGaze != null) { delay(2_000); touchGaze = null }
     }
-
     LaunchedEffect(winkSerial, companionMode, reduceMotion) {
         val newWink = winkSerial != handledWinkSerial
         handledWinkSerial = winkSerial
         wink.snapTo(1f)
         if (!newWink || !companionActive || reduceMotion) return@LaunchedEffect
-        wink.animateTo(0.06f, tween(110))
-        delay(250)
-        wink.animateTo(1f, tween(180))
+        wink.animateTo(0.06f, tween(85)); delay(180); wink.animateTo(1f, tween(135))
     }
-
-    LaunchedEffect(phase, companionMode) {
-        completionSmile = false
-        if (phase == AssistantPhase.COMPLETED && taskExpressionActive) {
-            completionSmile = true
-            delay(1_600)
-            completionSmile = false
-        }
-    }
-
-    LaunchedEffect(phase, companionMode, reduceMotion) {
-        errorShake.snapTo(0f)
-        if (phase != AssistantPhase.ERROR || !taskExpressionActive || reduceMotion) return@LaunchedEffect
-        for (position in listOf(-1f, 1f, -0.7f, 0.5f, 0f)) {
-            errorShake.animateTo(position, tween(55))
-        }
-    }
-
     LaunchedEffect(phase, companionMode, reduceMotion) {
         scan.snapTo(0f)
-        if (phase != AssistantPhase.EXECUTING || !taskExpressionActive || reduceMotion) return@LaunchedEffect
+        if (phase != AssistantPhase.EXECUTING || resting || reduceMotion) return@LaunchedEffect
         while (isActive) {
             scan.snapTo(0f)
-            scan.animateTo(1f, tween(2_100, easing = LinearEasing))
-            delay(500)
+            scan.animateTo(1f, tween(2_300, easing = LinearEasing))
+            delay(800)
         }
     }
 
-    val cameraGaze = faceOffset?.takeIf { it.x.isFinite() && it.y.isFinite() }
-    val stateGaze = when (phase) {
-        AssistantPhase.THINKING -> Offset(0.16f, -0.25f)
-        AssistantPhase.LISTENING, AssistantPhase.EXECUTING, AssistantPhase.ERROR -> Offset.Zero
-        else -> idleGaze
-    }
-    val requestedGaze = when {
-        !taskExpressionActive -> Offset.Zero
-        touchGaze != null -> touchGaze!!
-        cameraGaze != null -> {
-            // Camera tracking steers attention without cancelling the state expression.
-            val weight = if (idle) 1f else 0.45f
-            Offset(
-                stateGaze.x + cameraGaze.x.coerceIn(-0.65f, 0.65f) * weight,
-                stateGaze.y + cameraGaze.y.coerceIn(-0.45f, 0.45f) * weight,
-            )
+    val measuredLevel = micLevel.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+    val currentMeasuredLevel by rememberUpdatedState(measuredLevel)
+    LaunchedEffect(phase, listeningStage, companionMode, reduceMotion) {
+        if (phase != AssistantPhase.LISTENING || listeningStage != ListeningStage.SPEAKING || resting || reduceMotion) {
+            backchannelGate.reset()
+            return@LaunchedEffect
         }
-        else -> stateGaze
+        while (isActive) {
+            if (backchannelGate.observe(currentMeasuredLevel, System.nanoTime() / 1_000_000L)) {
+                player.play(listeningNodScript(), requestedPriority = 2)
+            }
+            delay(100)
+        }
     }
-    val attentionDuration = if (reduceMotion) 0 else 420
-    val gazeX by animateFloatAsState(requestedGaze.x.coerceIn(-0.65f, 0.65f), tween(attentionDuration), label = "eye-gaze-x")
-    val gazeY by animateFloatAsState(requestedGaze.y.coerceIn(-0.45f, 0.45f), tween(attentionDuration), label = "eye-gaze-y")
-    val tiltTarget = when {
-        !taskExpressionActive || reduceMotion -> 0f
-        phase == AssistantPhase.THINKING -> -2f
-        idle && cameraGaze == null && touchGaze == null -> idleTilt
-        else -> 0f
+    val statePose = when {
+        resting -> AvatarPose(openness = 0.06f, brightness = 0.4f)
+        phase == AssistantPhase.LISTENING -> listeningPose(listeningStage, measuredLevel)
+        phase == AssistantPhase.THINKING -> AvatarPose(gazeX = 0.16f, gazeY = -0.24f, openness = 0.74f, tilt = -2f)
+        phase == AssistantPhase.EXECUTING -> AvatarPose(openness = 0.82f)
+        phase == AssistantPhase.ERROR && feedback?.kind == AvatarFeedbackKind.UNCERTAIN -> AvatarPose(openness = 0.89f, tilt = -4f, asymmetry = -0.06f)
+        phase == AssistantPhase.ERROR && reduceMotion -> AvatarPose(openness = 0.86f, sadness = 0.55f)
+        phase == AssistantPhase.ERROR -> AvatarPose(openness = if (feedback == null) 0.86f else 0.95f,
+            sadness = if (feedback == null) 0.65f else 0f)
+        feedback?.kind == AvatarFeedbackKind.NEEDS_ATTENTION -> AvatarPose(tilt = 3f, asymmetry = 0.06f)
+        companionMode == EvaCompanionMode.DND -> AvatarPose(openness = 0.58f, brightness = 0.65f)
+        else -> AvatarPose(gazeX = idleGaze.x, gazeY = idleGaze.y, tilt = idleTilt)
     }
-    val headTilt by animateFloatAsState(tiltTarget, tween(if (reduceMotion) 0 else 650), label = "eye-head-tilt")
-    val opennessTarget = when {
-        companionMode == EvaCompanionMode.DND && idle && !completionSmile -> 0.48f
-        phase == AssistantPhase.THINKING -> 0.68f
-        phase == AssistantPhase.EXECUTING -> 0.78f
-        phase == AssistantPhase.LISTENING -> 1.08f
-        phase == AssistantPhase.ERROR -> 0.76f
-        else -> 1f
+    val cameraGaze = faceOffset?.takeIf { it.x.isFinite() && it.y.isFinite() }
+    val baseAttention = when {
+        resting -> Offset.Zero
+        touchGaze != null -> touchGaze!!
+        cameraGaze != null -> Offset(
+            statePose.gazeX + cameraGaze.x.coerceIn(-0.65f, 0.65f) * if (idle) 0.85f else 0.35f,
+            statePose.gazeY + cameraGaze.y.coerceIn(-0.45f, 0.45f) * if (idle) 0.85f else 0.35f,
+        )
+        else -> Offset(statePose.gazeX, statePose.gazeY)
     }
-    val openness by animateFloatAsState(opennessTarget, tween(if (reduceMotion) 0 else 260), label = "eye-openness")
-    val smile by animateFloatAsState(if (completionSmile) 1f else 0f, tween(if (reduceMotion) 0 else 200), label = "eye-smile")
-    val sadness by animateFloatAsState(if (phase == AssistantPhase.ERROR && taskExpressionActive) 1f else 0f, tween(if (reduceMotion) 0 else 260), label = "eye-sadness")
-    val audioLevel = micLevel.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
-    val exposure by animateFloatAsState(
-        targetValue = if (isSpeaking || phase == AssistantPhase.LISTENING) audioLevel else 0f,
-        animationSpec = tween(if (reduceMotion) 0 else 90),
-        label = "eye-audio-exposure",
-    )
+    val gazeX by animateFloatAsState(if (reduceMotion) 0f else baseAttention.x.coerceIn(-0.65f, 0.65f), tween(if (reduceMotion) 0 else 130), label = "eye-gaze-x")
+    val gazeY by animateFloatAsState(if (reduceMotion) 0f else baseAttention.y.coerceIn(-0.45f, 0.45f), tween(if (reduceMotion) 0 else 130), label = "eye-gaze-y")
+    val tilt by animateFloatAsState(if (reduceMotion) 0f else statePose.tilt, tween(if (reduceMotion) 0 else 320), label = "eye-head-tilt")
+    val openness by animateFloatAsState(statePose.openness, tween(if (reduceMotion) 0 else 160), label = "eye-openness")
+    val scale by animateFloatAsState(if (reduceMotion) 1f else statePose.scale, tween(if (reduceMotion) 0 else 180), label = "eye-scale")
+    val asymmetry by animateFloatAsState(statePose.asymmetry, tween(if (reduceMotion) 0 else 160), label = "eye-asymmetry")
+    val sadness by animateFloatAsState(statePose.sadness, tween(if (reduceMotion) 0 else 180), label = "eye-sadness")
+    val exposure by animateFloatAsState(if (phase == AssistantPhase.LISTENING) measuredLevel else 0f, tween(if (reduceMotion) 0 else 90), label = "measured-eye-audio")
+    val staticSmile = if (reduceMotion && phase == AssistantPhase.COMPLETED && feedback?.kind in
+        listOf(AvatarFeedbackKind.TASK_SUCCEEDED, AvatarFeedbackKind.DEMO_SUCCEEDED)) 1f else 0f
+    val basePose = statePose.copy(gazeX = gazeX, gazeY = gazeY, tilt = tilt, openness = openness,
+        scale = scale, asymmetry = asymmetry, sadness = sadness, smile = staticSmile)
+    val behavior = player.frame
+    val pose = if (reduceMotion || resting) basePose else behavior?.pose ?: basePose
     val accent = when (eyeStyle) {
         EvaEyeStyle.GOLDEN_MECHA -> Color(0xFFE5BC68)
         EvaEyeStyle.EVA_MINT, EvaEyeStyle.CYBER_COZMO -> Color(0xFF45E5CC)
     }
-    val resting = companionMode == EvaCompanionMode.REST
-    val semanticLabel = if (taskExpressionActive) phaseLabel(phase) else companionMode.title
-    val currentBackgroundTap by rememberUpdatedState(onBackgroundTap)
-    val currentEyeGaze by rememberUpdatedState(Offset(gazeX, gazeY))
+    val semanticLabel = when {
+        behavior?.scene != null -> "待机小剧场，${behavior.scene.label}，虚构场景"
+        resting -> companionMode.title
+        phase == AssistantPhase.LISTENING -> when (listeningStage) {
+            ListeningStage.PREPARING -> "正在准备麦克风"
+            ListeningStage.READY -> "请说话"
+            ListeningStage.RECOGNIZING -> "正在识别"
+            else -> "正在聆听"
+        }
+        phase == AssistantPhase.COMPLETED && feedback?.kind == AvatarFeedbackKind.TASK_SUCCEEDED -> "任务成功"
+        phase == AssistantPhase.COMPLETED && feedback?.kind == AvatarFeedbackKind.DEMO_SUCCEEDED -> "演示成功"
+        else -> phaseLabel(phase)
+    }
+    val currentEyeGaze by rememberUpdatedState(Offset(pose.gazeX, pose.gazeY))
 
-    Canvas(
-        modifier = modifier
-            .fillMaxWidth()
-            .defaultMinSize(minHeight = diameter)
+    Box(modifier.fillMaxWidth().defaultMinSize(minHeight = diameter)) {
+        Canvas(Modifier.matchParentSize()
             .pointerInput(companionMode, isLandscape) {
                 fun touchesEye(position: Offset): Boolean {
-                    val width = min(size.width * if (isLandscape) 0.255f else 0.27f, size.height * 0.72f)
-                    val height = min(size.width * 0.31f, size.height * 0.70f)
-                    val center = Offset(size.width / 2f, size.height / 2f) + Offset(
-                        currentEyeGaze.x * width * 0.28f,
-                        currentEyeGaze.y * height * 0.22f,
-                    )
-                    val distanceX = abs(position.x - center.x)
-                    return abs(distanceX - width * 0.72f) <= width * 0.58f &&
-                        abs(position.y - center.y) <= height * 0.60f
+                    val width = min(size.width * if (isLandscape) 0.255f else 0.27f, size.height * 0.53f)
+                    val height = min(size.width * 0.31f, size.height * 0.45f)
+                    val center = Offset(size.width / 2f, size.height * 0.43f) + Offset(
+                        currentEyeGaze.x * width * 0.28f, currentEyeGaze.y * height * 0.22f)
+                    return abs(abs(position.x - center.x) - width * 0.72f) <= width * 0.63f &&
+                        abs(position.y - center.y) <= height * 0.62f
+                }
+                fun interrupt() {
+                    player.cancel()
+                    scheduler.interrupt(System.nanoTime() / 1_000_000L)
+                    tapSerial++
+                    currentInteraction()
                 }
                 detectTapGestures(
+                    onPress = { interrupt(); tryAwaitRelease() },
                     onTap = { position ->
-                        if (companionMode != EvaCompanionMode.COMPANION || !touchesEye(position)) {
-                            currentBackgroundTap?.invoke()
-                        } else {
-                            touchGaze = Offset(
-                                ((position.x / size.width) - 0.5f).coerceIn(-0.5f, 0.5f) * 1.3f,
-                                ((position.y / size.height) - 0.5f).coerceIn(-0.5f, 0.5f) * 0.8f,
-                            )
-                            tapSerial++
-                        }
+                        if (companionMode != EvaCompanionMode.COMPANION || !touchesEye(position)) currentBackgroundTap?.invoke()
+                        else touchGaze = Offset(((position.x / size.width) - 0.5f).coerceIn(-0.5f, 0.5f) * 1.3f,
+                            ((position.y / size.height) - 0.43f).coerceIn(-0.5f, 0.5f) * 0.8f)
                     },
                     onDoubleTap = { position ->
                         if (companionMode == EvaCompanionMode.COMPANION && touchesEye(position)) {
-                            touchGaze = null
-                            winkSerial++
-                        } else {
-                            currentBackgroundTap?.invoke()
-                        }
+                            touchGaze = null; winkSerial++
+                        } else currentBackgroundTap?.invoke()
                     },
                 )
-            }
-            .semantics { contentDescription = "EVA 双眼，$semanticLabel" },
-    ) {
-        val eyeWidth = min(size.width * if (isLandscape) 0.255f else 0.27f, size.height * 0.72f)
-        val eyeHeight = min(size.width * 0.31f, size.height * 0.70f)
-        val spacing = eyeWidth * 0.72f
-        val sceneCenter = Offset(size.width / 2f, size.height / 2f)
-        val eyeCenter = sceneCenter + Offset(
-            gazeX * eyeWidth * 0.28f + (if (taskExpressionActive) errorShake.value else 0f) * eyeWidth * 0.02f,
-            gazeY * eyeHeight * 0.22f,
-        )
-        val intensity = when (companionMode) {
-            EvaCompanionMode.REST -> 0.36f
-            EvaCompanionMode.DND -> if (!idle || completionSmile) 0.91f + exposure * 0.09f else 0.60f
-            EvaCompanionMode.COMPANION -> 0.91f + exposure * 0.09f
-        }
-        withTransform({ rotate(headTilt, sceneCenter) }) {
-            for (index in 0..1) {
-                val left = index == 0
-                val perspective = (1f + gazeX * if (left) -0.09f else 0.09f).coerceIn(0.94f, 1.06f)
-                val center = eyeCenter + Offset(if (left) -spacing else spacing, 0f)
-                val eyeBlink = if (companionActive && !reduceMotion) {
-                    blink.value * if (left) 1f else wink.value
-                } else {
-                    1f
-                }
-                val width = eyeWidth * perspective
-                val height = eyeHeight * perspective * openness * eyeBlink
-                val localTilt = sadness * if (left) -10f else 10f
-                withTransform({ rotate(localTilt, center) }) {
-                    if (resting) {
-                        drawClosedEye(center, width * 0.90f, eyeHeight * 0.15f, accent, intensity, happy = false)
-                    } else if (smile > 0.02f) {
-                        drawMinimalEye(center, width, height, accent, intensity * (1f - smile), scan.value, phase == AssistantPhase.EXECUTING)
-                        drawClosedEye(center, width * 0.90f, eyeHeight * 0.28f, accent, intensity * smile, happy = true)
-                    } else {
-                        drawMinimalEye(center, width, height, accent, intensity, scan.value, phase == AssistantPhase.EXECUTING && taskExpressionActive)
+            }.semantics { contentDescription = "EVA 双眼，$semanticLabel" }
+        ) {
+            val eyeWidth = min(size.width * if (isLandscape) 0.255f else 0.27f, size.height * 0.53f)
+            val eyeHeight = min(size.width * 0.31f, size.height * 0.45f)
+            val spacing = eyeWidth * 0.72f
+            val sceneCenter = Offset(size.width / 2f, size.height * 0.43f)
+            val eyeCenter = sceneCenter + Offset(pose.gazeX * eyeWidth * 0.28f, (pose.gazeY * 0.22f + pose.nod) * eyeHeight)
+            val intensity = ((if (resting) 0.36f else 0.88f) * pose.brightness + exposure * 0.07f).coerceIn(0f, 1f)
+            withTransform({ rotate(pose.tilt, sceneCenter); scale(pose.scale, pose.scale, sceneCenter) }) {
+                for (index in 0..1) {
+                    val left = index == 0
+                    val perspective = (1f + pose.gazeX * if (left) -0.09f else 0.09f).coerceIn(0.94f, 1.06f)
+                    val center = eyeCenter + Offset(if (left) -spacing else spacing, if (left) -pose.asymmetry * eyeHeight * 0.10f else pose.asymmetry * eyeHeight * 0.10f)
+                    val eyeBlink = if (companionActive && !reduceMotion) blink.value * if (left) 1f else wink.value else 1f
+                    val width = eyeWidth * perspective * pose.width
+                    val height = eyeHeight * perspective * (pose.openness + if (left) pose.asymmetry else -pose.asymmetry).coerceAtLeast(0.05f) * eyeBlink
+                    withTransform({ rotate(pose.sadness * if (left) -9f else 9f, center) }) {
+                        if (resting) drawClosedEye(center, width * 0.9f, eyeHeight * 0.15f, accent, intensity, happy = false)
+                        else drawMinimalEye(center, width, height, accent, intensity, scan.value,
+                            phase == AssistantPhase.EXECUTING && behavior == null, pose.smile * eyeBlink)
                     }
                 }
             }
+            if (behavior?.scene != null && !resting && !reduceMotion) {
+                drawIdleSceneProp(behavior.scene, behavior.progress, pose.propAlpha, sceneCenter, eyeWidth, eyeHeight, accent)
+            }
+        }
+        if (behavior?.scene != null && !resting && !reduceMotion) {
+            Text(
+                text = "休闲小剧场 · ${behavior.scene.label}",
+                color = accent.copy(alpha = 0.50f),
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp)
+                    .testTag("avatar-idle-scene")
+                    .semantics { contentDescription = "休闲小剧场，${behavior.scene.label}" },
+            )
         }
     }
 }
@@ -309,21 +389,37 @@ private fun DrawScope.drawMinimalEye(
     intensity: Float,
     scan: Float,
     executing: Boolean,
+    smile: Float = 0f,
 ) {
     if (intensity <= 0f) return
-    val safeHeight = height.coerceAtLeast(width * 0.045f)
+    val curve = smile.coerceIn(0f, 1f)
+    val safeHeight = (height * (1f - curve) + width * 0.085f * curve).coerceAtLeast(width * 0.045f)
     val rect = Rect(center - Offset(width / 2f, safeHeight / 2f), Size(width, safeHeight))
     val corner = min(width * 0.29f, safeHeight / 2f)
-    val outline = Path().apply { addRoundRect(RoundRect(rect, CornerRadius(corner, corner))) }
+    val lift = width * 0.29f * curve
+    val edgeDrop = lift * 0.30f
+    val outline = Path().apply {
+        if (curve < 0.001f) addRoundRect(RoundRect(rect, CornerRadius(corner, corner)))
+        else {
+            moveTo(rect.left + corner, rect.top + edgeDrop)
+            quadraticTo(center.x, rect.top - lift, rect.right - corner, rect.top + edgeDrop)
+            quadraticTo(rect.right, rect.top + edgeDrop, rect.right, rect.top + corner + edgeDrop)
+            lineTo(rect.right, rect.bottom - corner + edgeDrop)
+            quadraticTo(rect.right, rect.bottom + edgeDrop, rect.right - corner, rect.bottom + edgeDrop)
+            quadraticTo(center.x, rect.bottom - lift, rect.left + corner, rect.bottom + edgeDrop)
+            quadraticTo(rect.left, rect.bottom + edgeDrop, rect.left, rect.bottom - corner + edgeDrop)
+            lineTo(rect.left, rect.top + corner + edgeDrop)
+            quadraticTo(rect.left, rect.top + edgeDrop, rect.left + corner, rect.top + edgeDrop)
+            close()
+        }
+    }
     // The glow stays close to each silhouette so the surrounding OLED scene stays black.
     for ((expansion, alpha) in listOf(0.08f to 0.028f, 0.04f to 0.055f, 0.015f to 0.10f)) {
         val padding = width * expansion
-        drawRoundRect(
-            color = accent.copy(alpha = alpha * intensity),
-            topLeft = rect.topLeft - Offset(padding, padding),
-            size = Size(width + padding * 2f, safeHeight + padding * 2f),
-            cornerRadius = CornerRadius(corner + padding, corner + padding),
-        )
+        if (curve < 0.001f) drawRoundRect(accent.copy(alpha = alpha * intensity),
+            rect.topLeft - Offset(padding, padding), Size(width + padding * 2f, safeHeight + padding * 2f),
+            CornerRadius(corner + padding, corner + padding))
+        else drawPath(outline, accent.copy(alpha = alpha * intensity), style = Stroke(padding * 2f))
     }
     drawPath(
         path = outline,
@@ -414,6 +510,6 @@ internal fun phaseLabel(phase: AssistantPhase): String = when (phase) {
     AssistantPhase.LISTENING -> "正在聆听"
     AssistantPhase.THINKING -> "正在思考"
     AssistantPhase.EXECUTING -> "正在执行"
-    AssistantPhase.COMPLETED -> "已完成"
+    AssistantPhase.COMPLETED -> "回复就绪"
     AssistantPhase.ERROR -> "遇到一点问题"
 }

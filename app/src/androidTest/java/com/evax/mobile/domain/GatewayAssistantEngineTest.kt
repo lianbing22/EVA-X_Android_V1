@@ -34,6 +34,7 @@ class GatewayAssistantEngineTest {
             assertEquals("WorkBuddy 官方回复", result.sampleLabel)
             assertFalse(result.isSample)
             assertEquals(AssistantSource.PC_GATEWAY, result.source)
+            assertEquals(AssistantOutcome.REPLY_RECEIVED, result.outcome)
             assertEquals(listOf("/healthz", "/api/connection", "/api/evax/stream"), server.requests.map { it.path })
             assertNull(server.requests[0].headers["authorization"])
             assertEquals("Bearer test-pairing-token", server.requests[1].headers["authorization"])
@@ -210,6 +211,49 @@ class GatewayAssistantEngineTest {
         }
     }
 
+    @Test
+    fun structuredTerminalResultCarriesBoundTaskAndEvidenceWithoutInferringText() {
+        TestGateway(streamBodyForRequest = { request ->
+            val requestId = JSONObject(request.body).getString("requestId")
+            "data: {\"type\":\"progress\",\"step\":\"电脑已接收\",\"index\":2,\"total\":3,\"requestId\":\"$requestId\",\"taskId\":\"run-test\"}\n\n" +
+                "data: {\"type\":\"completed\",\"text\":\"结构化终态\",\"outcome\":\"task_success\",\"requestId\":\"$requestId\",\"taskId\":\"run-test\",\"evidence\":{\"source\":\"codebuddy_run_stream\",\"status\":\"completed\",\"verified\":true,\"terminal\":true}}\n\n"
+        }).use { server ->
+            val events = collect(server.config)
+            val started = events.filterIsInstance<AssistantEvent.RequestStarted>().single()
+            val accepted = events.filterIsInstance<AssistantEvent.Progress>().single()
+            val result = events.filterIsInstance<AssistantEvent.Completed>().single().result
+            assertEquals(started.requestId, accepted.requestId)
+            assertEquals(started.requestId, result.requestId)
+            assertEquals(accepted.taskId, result.taskId)
+            assertEquals(AssistantOutcome.TASK_SUCCEEDED, result.outcome)
+            assertEquals(ExecutionEvidence("codebuddy_run_stream", "completed", true, true), result.evidence)
+            assertFalse(result.isSample)
+        }
+    }
+
+    @Test
+    fun anotherRequestEventIsRejectedWithoutOneTapRetry() {
+        TestGateway(streamBody = "data: {\"type\":\"completed\",\"text\":\"别的请求\",\"requestId\":\"old-request\",\"outcome\":\"task_success\"}\n\n").use { server ->
+            val error = failure { collect(server.config) }
+            assertEquals("invalid_event", error.code)
+            assertFalse(error.canRetryTask)
+        }
+    }
+
+    @Test
+    fun structuredPendingErrorPreservesOutcomeAndTaskId() {
+        TestGateway(streamBodyForRequest = { request ->
+            val requestId = JSONObject(request.body).getString("requestId")
+            "data: {\"type\":\"error\",\"code\":\"NEEDS_ATTENTION\",\"message\":\"电脑需要审批\",\"outcome\":\"task_pending\",\"requestId\":\"$requestId\",\"taskId\":\"run-test\",\"evidence\":{\"source\":\"codebuddy_run_stream\",\"status\":\"awaiting_approval\",\"verified\":true,\"terminal\":false}}\n\n"
+        }).use { server ->
+            val error = failure { collect(server.config) }
+            assertEquals(AssistantOutcome.NEEDS_ATTENTION, error.outcome)
+            assertEquals("run-test", error.taskId)
+            assertEquals(ExecutionEvidence("codebuddy_run_stream", "awaiting_approval", true, false), error.evidence)
+            assertFalse(error.canRetryTask)
+        }
+    }
+
     private fun collect(config: GatewayConnectionConfig): List<AssistantEvent> = runBlocking {
         withTimeout(5_000L) { GatewayAssistantEngine { config }.respond("test").toList() }
     }
@@ -235,6 +279,7 @@ private class TestGateway(
     private val streamStatus: Int = 200,
     private val streamContentType: String = "text/event-stream",
     private val streamBody: String = "data: {\"type\":\"progress\",\"step\":\"等待电脑回复\",\"index\":2,\"total\":5}\n\ndata: {\"type\":\"completed\",\"text\":\"官方助理回复\",\"taskState\":\"reply_received\"}\n\n",
+    private val streamBodyForRequest: ((GatewayRequest) -> String)? = null,
     private val expectedRequests: Int = 3,
     private val onRequest: (GatewayRequest) -> Unit = {},
 ) : Closeable {
@@ -280,7 +325,7 @@ private class TestGateway(
         val (status, body) = when (path) {
             "/healthz" -> healthStatus to healthBody
             "/api/connection" -> connectionStatus to connectionBody
-            "/api/evax/stream" -> streamStatus to streamBody
+            "/api/evax/stream" -> streamStatus to (streamBodyForRequest?.invoke(request) ?: streamBody)
             else -> 404 to "{}"
         }
         val data = body.toByteArray(Charsets.UTF_8)

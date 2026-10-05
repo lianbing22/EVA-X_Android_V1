@@ -29,4 +29,10 @@ class SpeechErrorMapperTest {
             SpeechErrorMapper.map(SpeechRecognizer.ERROR_NETWORK),
         )
     }
+
+    @Test
+    fun permissionDeniedDoesNotBecomeNoMatch() {
+        assertEquals(SpeechInputFailure.PERMISSION_DENIED,
+            SpeechErrorMapper.map(SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS))
+    }
 }

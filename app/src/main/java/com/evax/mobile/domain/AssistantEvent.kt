@@ -7,6 +7,8 @@ enum class AssistantSource {
 }
 
 sealed interface AssistantEvent {
+    data class RequestStarted(val requestId: String) : AssistantEvent
+
     data class SourceChanged(
         val source: AssistantSource,
         val label: String,
@@ -16,6 +18,8 @@ sealed interface AssistantEvent {
         val step: String,
         val index: Int,
         val total: Int,
+        val taskId: String? = null,
+        val requestId: String? = null,
     ) : AssistantEvent
 
     data class StreamDelta(

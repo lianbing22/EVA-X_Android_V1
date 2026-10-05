@@ -27,6 +27,12 @@ class GatewayAssistantEngine(
     private val beaconResolver: (suspend (String) -> GatewayTunnelBeacon?)? = null,
     private val onEndpointDiscovered: ((String) -> Unit)? = null,
 ) : AssistantEngine {
+    constructor(configProvider: () -> GatewayConnectionConfig) : this(
+        configProvider = configProvider,
+        beaconResolver = null,
+        onEndpointDiscovered = null,
+    )
+
     @Volatile
     private var cachedDiscoveredEndpoint: String? = null
 
@@ -194,6 +200,8 @@ class GatewayAssistantEngine(
         var receivedOutput = false
         var receivedCompleted = false
         var requestMayHaveReachedBridge = false
+        val requestId = UUID.randomUUID().toString()
+        onEvent(AssistantEvent.RequestStarted(requestId))
         try {
             withConnection(config, "/api/evax/stream", authenticated = true) { connection ->
                 connection.requestMethod = "POST"
@@ -203,7 +211,7 @@ class GatewayAssistantEngine(
                 connection.setRequestProperty("Accept", "text/event-stream")
                 val payload = JSONObject().apply {
                     put("prompt", prompt)
-                    put("requestId", UUID.randomUUID().toString())
+                    put("requestId", requestId)
                 }.toString()
                 connection.outputStream.use {
                     requestMayHaveReachedBridge = true
@@ -227,10 +235,17 @@ class GatewayAssistantEngine(
                         } catch (_: Exception) {
                             throw GatewayException("invalid_event", "电脑桥接返回了无效的指令事件，未确认执行结果。")
                         }
+                        val eventRequestId = nullableString(json, "requestId")
+                        if (eventRequestId != null && eventRequestId != requestId) {
+                            throw GatewayException("invalid_event", "电脑事件与当前请求不匹配，请先在电脑端确认状态。")
+                        }
                         when (json.optString("type")) {
                             "progress" -> {
                                 receivedOutput = true
-                                onEvent(AssistantEvent.Progress(json.optString("step", "处理中…"), json.optInt("index"), json.optInt("total")))
+                                onEvent(AssistantEvent.Progress(
+                                    json.optString("step", "处理中…"), json.optInt("index"), json.optInt("total"),
+                                    taskId = nullableString(json, "taskId"), requestId = eventRequestId,
+                                ))
                             }
                             "delta" -> {
                                 receivedOutput = true
@@ -243,22 +258,32 @@ class GatewayAssistantEngine(
                                     onEvent(AssistantEvent.SpeakSentence(sentence, json.optBoolean("isFirst"), json.optLong("latencyMs")))
                                 }
                             }
-                            "error" -> throw errorForCode(json.optString("code", "task_failed"), json.optString("message"), config)
+                            "error" -> {
+                                val mapped = errorForCode(json.optString("code", "task_failed"), json.optString("message"), config)
+                                throw GatewayException(
+                                    mapped.code, mapped.userMessage,
+                                    outcome = parseOutcome(json), taskId = nullableString(json, "taskId"),
+                                    requestId = eventRequestId, evidence = parseEvidence(json),
+                                )
+                            }
                             "completed" -> {
                                 val text = json.optString("text").trim()
-                                if (text.isEmpty() || json.optBoolean("isSample", false) ||
-                                    json.optString("taskState") != "reply_received"
-                                ) {
+                                val outcome = parseOutcome(json)
+                                if (text.isEmpty() || json.optBoolean("isSample", false) || outcome == null) {
                                     throw GatewayException("invalid_result", "电脑桥接未返回有效的 WorkBuddy 回复，未确认执行结果。")
                                 }
                                 receivedCompleted = true
-                                // 收到 assistant 回复仅确认响应结束，具体任务结果以回复中的事实为准。
+                                // 流结束仅代表桥接响应结束；任务成功由结构化证据和当前任务标识共同确认。
                                 onEvent(AssistantEvent.Completed(AssistantResult(
                                     text = text,
                                     sampleLabel = "WorkBuddy 官方回复",
                                     followUps = followUps(json.optJSONArray("followUps")),
                                     isSample = false,
                                     source = AssistantSource.PC_GATEWAY,
+                                    outcome = outcome,
+                                    taskId = nullableString(json, "taskId"),
+                                    requestId = eventRequestId,
+                                    evidence = parseEvidence(json),
                                 )))
                                 break
                             }
@@ -283,6 +308,24 @@ class GatewayAssistantEngine(
             }
             throw networkFailure(failure)
         }
+    }
+
+    private fun nullableString(json: JSONObject, key: String): String? =
+        (json.opt(key) as? String)?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun parseOutcome(json: JSONObject): AssistantOutcome? = when (nullableString(json, "outcome")) {
+        "reply_received" -> AssistantOutcome.REPLY_RECEIVED
+        "task_success" -> AssistantOutcome.TASK_SUCCEEDED
+        "task_pending" -> AssistantOutcome.NEEDS_ATTENTION
+        "task_failed" -> AssistantOutcome.FAILED
+        "task_uncertain" -> AssistantOutcome.UNCERTAIN
+        "task_cancelled" -> AssistantOutcome.CANCELLED
+        null -> if (json.optString("taskState") == "reply_received") AssistantOutcome.REPLY_RECEIVED else null
+        else -> null
+    }
+
+    private fun parseEvidence(json: JSONObject): ExecutionEvidence? = json.optJSONObject("evidence")?.let {
+        ExecutionEvidence(it.optString("source"), it.optString("status"), it.optBoolean("verified"), it.optBoolean("terminal"))
     }
 
     private suspend fun <T> withConnection(
@@ -325,7 +368,12 @@ class GatewayAssistantEngine(
             connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { JSONObject(it.readText()) }
         }.getOrNull()
         if (error != null && error.optString("code").isNotBlank()) {
-            throw errorForCode(error.optString("code"), error.optString("message"), config)
+            val mapped = errorForCode(error.optString("code"), error.optString("message"), config)
+            throw GatewayException(
+                mapped.code, mapped.userMessage,
+                outcome = parseOutcome(error), taskId = nullableString(error, "taskId"),
+                requestId = nullableString(error, "requestId"), evidence = parseEvidence(error),
+            )
         }
         if (connection.requestMethod == "POST" && status >= 500) {
             throw GatewayException("SUBMISSION_UNKNOWN", "指令发送后电脑桥接返回 HTTP $status，无法确认电脑端是否接收。请先查看电脑端状态，不要重复提交。")
